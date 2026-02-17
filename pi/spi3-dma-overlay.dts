@@ -1,0 +1,46 @@
+/*
+ * spi3-dma-overlay.dts
+ *
+ * Enable DMA for SPI3 on BCM2711 (Raspberry Pi 4 / CM4).
+ *
+ * The BCM2711 datasheet (section 4.2.1.3, pages 61-62) incorrectly lists
+ * DREQ 16 as "SPI1 TX" and DREQ 18 as "SPI1 RX". SPI1 is a mini SPI
+ * with no DMA support. These DREQs actually belong to SPI3.
+ * This was confirmed by Broadcom (see: github.com/raspberrypi/documentation/issues/3232).
+ *
+ * Usage:
+ *   1. Compile:  dtc -@ -I dts -O dtb -o spi3-dma.dtbo spi3-dma-overlay.dts
+ *   2. Copy:     sudo cp spi3-dma.dtbo /boot/overlays/
+ *   3. In /boot/firmware/config.txt (or /boot/config.txt on older images):
+ *        dtoverlay=spi3-2cs        # (or spi3-1cs) — enables SPI3 pins + CS
+ *        dtoverlay=spi3-dma        # this overlay — adds DMA properties
+ *   4. Reboot
+ *
+ * Verify with:
+ *   dmesg | grep -i spi
+ *   — You should NOT see "no tx-dma configuration found"
+ *   — You should see DMA channel allocation messages instead
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2711";
+
+	fragment@0 {
+		target = <&spi3>;
+		__overlay__ {
+			/*
+			 * DREQ 16 = SPI3 TX  (mislabeled "SPI1 TX" in datasheet)
+			 * DREQ 18 = SPI3 RX  (mislabeled "SPI1 RX" in datasheet)
+			 *
+			 * The spi-bcm2835 driver looks for "tx" and "rx" dma-names
+			 * and uses them to request DMA channels from the bcm2835-dma
+			 * controller. The single cell after &dma is the DREQ number.
+			 */
+			dmas = <&dma 16>, <&dma 18>;
+			dma-names = "tx", "rx";
+		};
+	};
+};

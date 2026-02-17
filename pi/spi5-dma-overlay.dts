@@ -1,0 +1,59 @@
+/*
+ * spi5-dma-overlay.dts
+ *
+ * Enable DMA for SPI5 on BCM2711 (Raspberry Pi 4 / CM4).
+ *
+ * SPI5 DMA uses ALTERNATE DREQs that share lines with UART5.
+ * The BCM2711 datasheet (page 62) states:
+ *   "The alternate DREQs are available by changing the DMA_CNTRL_MUX
+ *    bits in the PACTL_CS register in the peri audio control block."
+ *
+ * DREQ NUMBERS (from BCM2711 datasheet section 4.2.1.3, page 62):
+ *   DREQ 21 = UART5 TX (default) -> SPI5 TX (alternate, via PACTL_CS mux)
+ *   DREQ 22 = UART5 RX (default) -> SPI5 RX (alternate, via PACTL_CS mux)
+ *
+ * IMPORTANT: This overlay alone is NOT sufficient. You MUST also:
+ *   - Run the PACTL_CS mux configuration at boot (see spi45-dma-mux.sh)
+ *   - Load the dma40-expand overlay to add DMA4 channels for SPI5
+ *
+ * This overlay uses the DMA4 controller (&dma40) instead of the legacy
+ * DMA controller (&dma) because the legacy controller's 8 channels are
+ * exhausted by SPI0 + SPI3 + SPI4 + MMC.
+ *
+ * CAUTION: Using SPI5 DMA will DISABLE DMA for UART5.
+ * Do NOT load the uart5 overlay if you need SPI5 DMA.
+ *
+ * Usage:
+ *   1. Compile:  dtc -@ -I dts -O dtb -o spi5-dma.dtbo spi5-dma-overlay.dts
+ *   2. Copy:     sudo cp spi5-dma.dtbo /boot/overlays/
+ *   3. In /boot/firmware/config.txt:
+ *        dtoverlay=spi5-1cs          # enables SPI5 pins
+ *        dtoverlay=spi5-dma          # this overlay
+ *   4. Enable the PACTL_CS mux service (see spi45-dma-mux.sh)
+ *   5. Reboot
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2711";
+
+	fragment@0 {
+		target = <&spi5>;
+		__overlay__ {
+			/*
+			 * DREQ 21 = SPI5 TX (alternate, shared with UART5 TX)
+			 * DREQ 22 = SPI5 RX (alternate, shared with UART5 RX)
+			 *
+			 * Uses DMA4 controller (&dma40) — the legacy controller
+			 * (&dma) has no free channels.
+			 *
+			 * Requires PACTL_CS DMA_CNTRL_MUX bit 25 to be set
+			 * at boot (see spi45-dma-mux.sh / spi45-dma-mux.service).
+			 */
+			dmas = <&dma40 21>, <&dma40 22>;
+			dma-names = "tx", "rx";
+		};
+	};
+};

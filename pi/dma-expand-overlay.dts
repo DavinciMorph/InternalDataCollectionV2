@@ -1,0 +1,34 @@
+/*
+ * dma-expand-overlay.dts
+ *
+ * Expand the BCM2711 DMA channel mask to include channels 1 and 3.
+ *
+ * The default firmware mask (0x07F5) provides 9 channels but only 8
+ * are usable for peripherals. With SPI0 + SPI3 + SPI4 + MMC consuming
+ * 7 channels, only 1 remains — not enough for SPI5 (needs TX + RX = 2).
+ *
+ * This overlay changes the mask to 0x07FF, adding channels 1 and 3.
+ * These are normally reserved for the GPU's camera/display pipelines.
+ * Safe to reclaim if the Pi is not using the camera interface.
+ *
+ * Usage:
+ *   1. Compile:  dtc -@ -I dts -O dtb -o dma-expand.dtbo dma-expand-overlay.dts
+ *   2. Copy:     sudo cp dma-expand.dtbo /boot/overlays/
+ *   3. In /boot/firmware/config.txt, add BEFORE any spi overlays:
+ *        dtoverlay=dma-expand
+ *   4. Reboot
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2711";
+
+	fragment@0 {
+		target = <&dma>;
+		__overlay__ {
+			brcm,dma-channel-mask = <0x07ff>;
+		};
+	};
+};

@@ -1,0 +1,34 @@
+/*
+ * dma40-expand-overlay.dts
+ *
+ * Expand the BCM2711 DMA4 controller channel mask to include channels 11 and 14.
+ *
+ * The default firmware mask (0x3000) only enables channels 12 and 13,
+ * both used by HDMI audio. SPI5 needs 2 DMA channels (TX + RX) on the
+ * DMA4 controller because the legacy DMA controller is fully allocated.
+ *
+ * This overlay changes the mask to 0x7800, adding channels 11 and 14.
+ * These are DMA4 channels NOT used by the GPU (the GPU uses legacy
+ * channels 0-10), so this is safe unlike expanding the legacy mask.
+ *
+ * Usage:
+ *   1. Compile:  dtc -@ -I dts -O dtb -o dma40-expand.dtbo dma40-expand-overlay.dts
+ *   2. Copy:     sudo cp dma40-expand.dtbo /boot/overlays/
+ *   3. In /boot/firmware/config.txt, add BEFORE spi5-dma:
+ *        dtoverlay=dma40-expand
+ *   4. Reboot
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2711";
+
+	fragment@0 {
+		target = <&dma40>;
+		__overlay__ {
+			brcm,dma-channel-mask = <0x7800>;
+		};
+	};
+};

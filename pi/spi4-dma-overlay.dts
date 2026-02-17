@@ -1,0 +1,53 @@
+/*
+ * spi4-dma-overlay.dts
+ *
+ * Enable DMA for SPI4 on BCM2711 (Raspberry Pi 4 / CM4).
+ *
+ * SPI4 DMA uses ALTERNATE DREQs that share lines with UART3.
+ * The BCM2711 datasheet (page 62) states:
+ *   "The alternate DREQs are available by changing the DMA_CNTRL_MUX
+ *    bits in the PACTL_CS register in the peri audio control block."
+ *
+ * IMPORTANT: This overlay alone is NOT sufficient. You MUST also
+ * run the PACTL_CS mux configuration at boot time to route the
+ * DREQs from UART3 to SPI4. See spi45-dma-mux.sh.
+ *
+ * DREQ NUMBERS (from BCM2711 datasheet section 4.2.1.3, page 62):
+ *   DREQ 19 = UART3 TX (default) → SPI4 TX (alternate, via PACTL_CS mux)
+ *   DREQ 20 = UART3 RX (default) → SPI4 RX (alternate, via PACTL_CS mux)
+ *
+ * CAUTION: Using SPI4 DMA will DISABLE DMA for UART3.
+ * Do NOT load the uart3 overlay if you need SPI4 DMA.
+ *
+ * Usage:
+ *   1. Verify DREQ numbers from BCM2711 datasheet page 62
+ *   2. Compile:  dtc -@ -I dts -O dtb -o spi4-dma.dtbo spi4-dma-overlay.dts
+ *   3. Copy:     sudo cp spi4-dma.dtbo /boot/overlays/
+ *   4. In /boot/firmware/config.txt:
+ *        dtoverlay=spi4-2cs          # enables SPI4 pins
+ *        dtoverlay=spi4-dma          # this overlay
+ *   5. Enable the PACTL_CS mux service (see spi45-dma-mux.sh)
+ *   6. Reboot
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2711";
+
+	fragment@0 {
+		target = <&spi4>;
+		__overlay__ {
+			/*
+			 * DREQ 19 = SPI4 TX (alternate, shared with UART3 TX)
+			 * DREQ 20 = SPI4 RX (alternate, shared with UART3 RX)
+			 *
+			 * Requires PACTL_CS DMA_CNTRL_MUX bit 24 to be set
+			 * at boot (see spi45-dma-mux.sh / spi45-dma-mux.service).
+			 */
+			dmas = <&dma 19>, <&dma 20>;
+			dma-names = "tx", "rx";
+		};
+	};
+};

@@ -1,0 +1,13 @@
+[Unit]
+Description=Configure PACTL_CS DMA mux for SPI4/SPI5
+DefaultDependencies=no
+Before=sysinit.target
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spi45-dma-mux.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target
