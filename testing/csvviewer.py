@@ -21,6 +21,7 @@ Usage:
 """
 
 import sys
+import os
 import argparse
 import numpy as np
 from scipy import signal as sig
@@ -206,7 +207,8 @@ class CSVViewer(QtWidgets.QMainWindow):
 
 def main():
     parser = argparse.ArgumentParser(description='CSV Data Viewer')
-    parser.add_argument('--file', type=str, default='all_ports_ch1_data.csv', help='CSV file to view')
+    default_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'all_ports_ch1_data.csv')
+    parser.add_argument('--file', type=str, default=default_csv, help='CSV file to view')
     parser.add_argument('--window', type=float, default=5.0, help='Visible window in seconds (default: 5.0)')
     args = parser.parse_args()
 

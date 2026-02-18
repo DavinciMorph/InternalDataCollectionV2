@@ -719,8 +719,8 @@ class ADS1299_Controller:
 
         # 3. Multiple software RESETs to ensure all devices settle properly
         #    Some devices may need multiple reset cycles to reach a stable state
-        reset_time = 1.0 + (num_devices * 0.1)  # Per-reset settling time
-        num_resets = 5
+        reset_time = 0.1 + (num_devices * 0.01)  # Per-reset settling time
+        num_resets = 2
         print(f"  Performing {num_resets} software resets ({reset_time:.1f}s each for {num_devices} devices)...")
         for reset_num in range(num_resets):
             spi.send_command(ADS1299_Cmd.RESET)
@@ -791,7 +791,7 @@ class ADS1299_Controller:
             """Write register and retry until verified."""
             for attempt in range(max_attempts):
                 spi.write_registers(reg, [value])
-                time.sleep(0.1)
+                time.sleep(0.01)
                 readback = spi.read_registers(reg, 1)[0]
                 if readback == value:
                     if attempt > 0:
@@ -807,7 +807,7 @@ class ADS1299_Controller:
 
         # Wait for reference buffer to stabilize
         print(f"  Waiting for reference buffer...")
-        time.sleep(0.5)
+        time.sleep(0.2)
 
         # CONFIG1 - sample rate and daisy settings
         if not write_and_verify(ADS1299_Reg.CONFIG1, config.config1, "CONFIG1"):
@@ -895,7 +895,7 @@ class ADS1299_Controller:
         for spi_dev in spi_devices:
             spi_dev.send_command(ADS1299_Cmd.RDATAC)
 
-        time.sleep(0.750)  # 750ms settling after RDATAC
+        time.sleep(0.200)  # 200ms settling after RDATAC
 
         print("    Verifying device communication after RDATAC...")
         rdatac_verify_failures = []
@@ -924,7 +924,7 @@ class ADS1299_Controller:
         start_controller.set_all_high()
         print(f"    [All START pins asserted simultaneously]")
 
-        time.sleep(0.500)  # 500ms synchronization - longer delay for better sync
+        time.sleep(0.100)  # 100ms synchronization after START
 
         for spi_dev in spi_devices:
             print(f"    {spi_dev.config.port_id}: START asserted [OK]")
@@ -1683,48 +1683,36 @@ class StreamingServer:
                 spi_dev.read_data()  # Suppress startup clearing
 
         self.streaming_active = True
-        
-        # Start acquisition thread (runs continuously)
+
+        # Start acquisition thread (runs continuously, writes CSV)
         acq_thread = threading.Thread(target=self.acquisition_thread, daemon=True)
         acq_thread.start()
-        
-        # Start streaming thread (handles client connections)
-        stream_thread = threading.Thread(target=self.streaming_thread, daemon=True)
-        stream_thread.start()
-        
-        print(f"\n{'='*60}\nSERVER RUNNING - Ctrl+C to stop, clients reconnect anytime\n{'='*60}\n")
-        
-        # Main loop - wait for clients and handle reconnection
+
+        print(f"\n{'='*60}\nACQUISITION RUNNING (CSV only, no streaming) - Ctrl+C to stop\n{'='*60}\n")
+
         try:
             while not self.stop_event.is_set():
-                if not self.client_connected.is_set():
-                    # Wait for new client
-                    self.wait_for_client()
-                else:
-                    # Client connected, just wait
-                    time.sleep(1)
-                    
+                time.sleep(1)
+
         except KeyboardInterrupt:
             print("\n\nShutdown requested...")
-        
+
         # Shutdown
-        print("\nStopping server...")
+        print("\nStopping...")
         self.stop_event.set()
-        self.disconnect_client()
-        
+
         acq_thread.join(timeout=2)
-        stream_thread.join(timeout=2)
-        
+
         # Stop ADS1299 devices
         for spi_dev in self.spi_devices:
             spi_dev.start.set_low()
             spi_dev.send_command(ADS1299_Cmd.STOP)
-        
+
         # Final statistics
         print(f"\n{'='*60}\nFINAL STATISTICS\n{'='*60}")
         elapsed = time.time() - self.start_time if self.start_time else 0
         rate = self.samples_acquired / elapsed if elapsed > 0 else 0
-        print(f"Sessions: {self.session_count}, Acquired: {self.samples_acquired}, Sent: {self.total_samples_sent + self.samples_sent}")
+        print(f"Acquired: {self.samples_acquired}")
         print(f"Runtime: {elapsed:.1f}s, Rate: {rate:.1f}Hz\n{'='*60}\n")
     
     def cleanup(self):
@@ -1881,18 +1869,12 @@ Port format: bus,device,name,num_daisy
     else:
         print(f"\n{'='*60}\n[OK] SYSTEM INITIALIZATION COMPLETE!\n{'='*60}")
     
-    # Create streaming server
-    server = StreamingServer(spi_devices, host=args.host, port=args.port)
-    
+    # Create acquisition runner (CSV only, no TCP streaming)
+    server = StreamingServer(spi_devices)
+
     try:
-        # Start server and wait for client
-        if not server.start_server():
-            print("Failed to start server")
-            return
-        
-        # Run acquisition and streaming
         server.run()
-        
+
     except KeyboardInterrupt:
         print("\n\nStopped by user")
     except Exception as e:

@@ -284,7 +284,7 @@ def main():
     if len(sys.argv) > 1:
         files = sys.argv[1:]
     else:
-        default = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'all_ports_ch1_data.csv')
+        default = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'all_ports_ch1_data.csv')
         if os.path.exists(default):
             files = [default]
         else:

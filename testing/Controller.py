@@ -432,21 +432,18 @@ class ADS1299_SPI:
         Returns (status_bytes, channel_data) where channel_data is a list of
         per-device channel lists.
         """
-        bytes_per_device = 27
-        channel_data = []
+        raw_bytes = bytes(raw_data)
         first_status = raw_data[0:3]
+        channel_data = []
 
         for device_idx in range(num_devices):
-            device_offset = device_idx * bytes_per_device
-            ch_data_offset = device_offset + 3
+            ch_data_offset = device_idx * 27 + 3
 
             device_channels = []
             for ch in range(8):
-                byte_offset = ch_data_offset + (ch * 3)
-                value = (raw_data[byte_offset] << 16) | (raw_data[byte_offset + 1] << 8) | raw_data[byte_offset + 2]
-                if value & 0x800000:
-                    value = value - 0x1000000
-                device_channels.append(value)
+                offset = ch_data_offset + ch * 3
+                device_channels.append(
+                    int.from_bytes(raw_bytes[offset:offset + 3], 'big', signed=True))
 
             channel_data.append(device_channels)
 

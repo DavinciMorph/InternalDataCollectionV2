@@ -185,6 +185,7 @@ class PortColumn(QtWidgets.QWidget):
         self.device_created: List[bool] = [False] * self.num_devices
         self.device_containers: List[QtWidgets.QWidget] = []
         self.device_buttons: List[QtWidgets.QPushButton] = []
+        self._dev_stuck_state: List[bool] = [False] * self.num_devices
 
         self.setup_ui()
 
@@ -312,6 +313,7 @@ class PortColumn(QtWidgets.QWidget):
             # Clicking active device hides it
             self.device_containers[dev_idx].setVisible(False)
             self.device_buttons[dev_idx].setStyleSheet(self._dev_btn_style(False))
+            self._dev_stuck_state[dev_idx] = False
             self.active_device = None
             return
 
@@ -321,12 +323,49 @@ class PortColumn(QtWidgets.QWidget):
             self.device_buttons[self.active_device].setStyleSheet(
                 self._dev_btn_style(False)
             )
+            self._dev_stuck_state[self.active_device] = False
 
         # Show new device
         self._create_device_plots(dev_idx)
         self.device_containers[dev_idx].setVisible(True)
         self.device_buttons[dev_idx].setStyleSheet(self._dev_btn_style(True))
+        self._dev_stuck_state[dev_idx] = False
         self.active_device = dev_idx
+
+    def _dev_btn_stuck_style(self):
+        return """
+            QPushButton {
+                background-color: #440000;
+                color: #ff4444;
+                border: 2px solid #ff0000;
+                border-radius: 4px;
+                padding: 4px 2px;
+                font-size: 9pt;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #550000;
+            }
+        """
+
+    def update_stuck_indicators(self, stuck_channels):
+        """Color device buttons red when any of their 8 channels are stuck.
+        Only calls setStyleSheet when a button's stuck state actually changes."""
+        for d in range(self.num_devices):
+            dev_ch_start = self.start_ch_idx + d * 8
+            dev_stuck = any(
+                ch_idx in stuck_channels
+                for ch_idx in range(dev_ch_start, dev_ch_start + 8)
+            )
+            was_stuck = self._dev_stuck_state[d]
+            if dev_stuck == was_stuck:
+                continue
+            self._dev_stuck_state[d] = dev_stuck
+            if dev_stuck:
+                self.device_buttons[d].setStyleSheet(self._dev_btn_stuck_style())
+            else:
+                is_active = (self.active_device == d)
+                self.device_buttons[d].setStyleSheet(self._dev_btn_style(is_active))
 
     def update_plots(self, x_min, x_max, rescale_y):
         if self.active_device is None:
@@ -428,6 +467,12 @@ class SignalVisualizer(QtWidgets.QMainWindow):
             self.notch_zi_template.copy() for _ in range(self.total_channels)
         ]
 
+        # Stuck channel detection
+        self.stuck_threshold = 50  # 50 consecutive identical = 200ms at 250Hz
+        self.stuck_last_value = np.full(ch, np.nan)
+        self.stuck_count = np.zeros(ch, dtype=int)
+        self.stuck_channels = {}  # ch_idx -> (port_name, dev_idx, ch_in_dev, stuck_value)
+
     def _on_config_received(self, port_configs):
         """Rebuild UI when server sends its actual port configuration."""
         new_spi_ports = [
@@ -507,6 +552,17 @@ class SignalVisualizer(QtWidgets.QMainWindow):
         self.notch_btn.clicked.connect(self.toggle_notch)
         top_bar.addWidget(self.notch_btn)
         layout.addLayout(top_bar)
+
+        # Stuck channel warning banner (hidden by default)
+        self.stuck_banner = QtWidgets.QLabel('')
+        self.stuck_banner.setStyleSheet(
+            'background-color: #440000; color: #ff4444; font-size: 11pt; '
+            'font-weight: bold; padding: 8px; border: 2px solid #ff0000; '
+            'border-radius: 4px;'
+        )
+        self.stuck_banner.setVisible(False)
+        self.stuck_banner.setWordWrap(True)
+        layout.addWidget(self.stuck_banner)
 
         # Port columns — side by side, each with button + plots below
         columns_widget = QtWidgets.QWidget()
@@ -594,6 +650,38 @@ class SignalVisualizer(QtWidgets.QMainWindow):
         self.buf_count = min(self.buf_count + n, self.max_samples)
         self.sample_count += n
 
+        # Stuck channel detection (vectorized across all channels)
+        batch_min = raw.min(axis=0)
+        batch_max = raw.max(axis=0)
+        constant_mask = (batch_min == batch_max)  # channels with all-same values
+
+        same_as_prev = constant_mask & (raw[0, :] == self.stuck_last_value)
+        self.stuck_count[same_as_prev] += n
+
+        new_constant = constant_mask & ~same_as_prev
+        self.stuck_count[new_constant] = n
+
+        self.stuck_count[~constant_mask] = 0
+
+        self.stuck_last_value = raw[-1, :].copy()
+
+        # Rebuild stuck_channels dict ~1/sec (every 250 samples)
+        if self.sample_count % 250 < n:
+            self.stuck_channels = {}
+            stuck_set = set(np.where(self.stuck_count >= self.stuck_threshold)[0])
+            if stuck_set:
+                ch_offset = 0
+                for port in self.spi_ports:
+                    for dev_idx in range(port.num_devices):
+                        for ch_in_dev in range(8):
+                            ch_idx = ch_offset + dev_idx * 8 + ch_in_dev
+                            if ch_idx in stuck_set:
+                                self.stuck_channels[ch_idx] = (
+                                    port.name, dev_idx, ch_in_dev,
+                                    float(self.stuck_last_value[ch_idx])
+                                )
+                    ch_offset += port.num_channels
+
         if self.sample_count % 250 < n:  # crossed a 250-sample boundary
             elapsed = time.time() - self.start_time
             rate = self.sample_count / elapsed if elapsed > 0 else 0
@@ -660,6 +748,36 @@ class SignalVisualizer(QtWidgets.QMainWindow):
             # Update only expanded columns
             for col in self.port_columns:
                 col.update_plots(x_min, x_max, rescale_y)
+
+            # Update stuck channel banner
+            if self.stuck_channels:
+                groups = {}
+                for ch_idx, (port_name, dev_idx, ch_in_dev, val) in self.stuck_channels.items():
+                    key = (port_name, dev_idx)
+                    if key not in groups:
+                        groups[key] = []
+                    groups[key].append((ch_in_dev, val))
+
+                parts = []
+                for (port_name, dev_idx), channels in sorted(groups.items()):
+                    chs = sorted(channels, key=lambda x: x[0])
+                    val = chs[0][1]
+                    ch_nums = [c[0] + 1 for c in chs]
+                    parts.append(f"{port_name}/Dev{dev_idx+1} Ch{ch_nums} = {val:.0f}")
+
+                self.stuck_banner.setText(
+                    f"STUCK CHANNELS ({len(self.stuck_channels)}): {' | '.join(parts)}"
+                )
+                self.stuck_banner.setVisible(True)
+
+                if rescale_y:
+                    for col in self.port_columns:
+                        col.update_stuck_indicators(self.stuck_channels)
+            else:
+                self.stuck_banner.setVisible(False)
+                if rescale_y:
+                    for col in self.port_columns:
+                        col.update_stuck_indicators({})
 
         except Exception as e:
             print(f"[viz] update error: {e}")
