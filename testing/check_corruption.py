@@ -2,9 +2,12 @@
 check_corruption.py — Fast corruption analysis for multi-port ADS1299 CSV files.
 
 Usage:
-    python check_corruption.py                          # analyzes all_ports_ch1_data.csv
+    python check_corruption.py                          # analyzes all_channels_data.csv
     python check_corruption.py my_recording.csv         # analyzes a specific file
     python check_corruption.py recording1.csv recording2.csv  # multiple files
+
+Expects CSV columns: timestamp, sample_number, Port{1-7}_dev{1-4}_ch{1-8}
+(224 data channels from 7 ports × 4 daisy-chained ADS1299 × 8 channels each)
 
 Detects:
     - Single-sample spikes (value jumps > threshold from neighbors)
@@ -28,6 +31,16 @@ RAIL_VALUES = {0, 8388607, -8388608}
 BIT_SHIFTS_TO_CHECK = [1, 2, 3, 4]  # check if corrupted = expected >> N
 RANGE_LOW = -5000               # test signal expected minimum
 RANGE_HIGH = 3000               # test signal expected maximum
+MAX_DETAIL_LINES = 10           # max detailed events to print per category
+
+
+def parse_channel_name(ch_name):
+    """Parse 'Port1_dev2_ch3' into (port, device, channel) strings."""
+    parts = ch_name.split('_')
+    if len(parts) == 3:
+        return parts[0], f"{parts[0]}_{parts[1]}", ch_name
+    # Fallback for unexpected formats
+    return parts[0], ch_name, ch_name
 
 
 def load_csv(filepath):
@@ -60,7 +73,15 @@ def analyze_file(filepath):
     data_names = [header[i] for i in data_cols]
     n_channels = len(data_cols)
 
-    # Parse data
+    # Parse data, skipping truncated rows
+    expected_cols = len(header)
+    good_rows = [i for i in range(n_samples) if len(rows[i]) == expected_cols]
+    n_skipped = n_samples - len(good_rows)
+    if n_skipped:
+        print(f"  WARNING: Skipped {n_skipped} truncated row(s)")
+    rows = [rows[i] for i in good_rows]
+    n_samples = len(rows)
+
     timestamps = [float(rows[i][ts_col]) for i in range(n_samples)]
     sample_nums = [int(rows[i][sn_col]) for i in range(n_samples)]
     data = []
@@ -204,36 +225,52 @@ def analyze_file(filepath):
     print(f"\n  --- Corruption ---")
 
     if startup_events:
-        ports_affected = set(ch.split('_')[0] for (_, ch, _) in startup_events)
+        ports_affected = set(parse_channel_name(ch)[0] for (_, ch, _) in startup_events)
         print(f"  Startup artifacts:  {len(startup_events)} channels ({', '.join(sorted(ports_affected))})")
     else:
         print(f"  Startup artifacts:  0")
 
     print(f"  Rail values:        {len(rail_events)}")
     if rail_events:
-        for idx, ch, val in rail_events[:5]:
+        # Group rail events by port
+        rail_by_port = {}
+        for idx, ch, val in rail_events:
+            port = parse_channel_name(ch)[0]
+            rail_by_port[port] = rail_by_port.get(port, 0) + 1
+        for port in sorted(rail_by_port.keys()):
+            print(f"    {port}: {rail_by_port[port]}")
+        for idx, ch, val in rail_events[:MAX_DETAIL_LINES]:
             print(f"    Sample {sample_nums[idx]:>7}: {ch} = {val}")
-        if len(rail_events) > 5:
-            print(f"    ... and {len(rail_events)-5} more")
+        if len(rail_events) > MAX_DETAIL_LINES:
+            print(f"    ... and {len(rail_events)-MAX_DETAIL_LINES} more")
 
     n_spikes = len(spike_by_sample)
     total_spike_channels = len(spike_events)
-    print(f"  Spike events:       {n_spikes} samples, {total_spike_channels} channels affected")
+    print(f"  Spike events:       {n_spikes} samples, {total_spike_channels} channel-events")
     if spike_by_sample:
-        for idx in sorted(spike_by_sample.keys())[:10]:
+        for idx in sorted(spike_by_sample.keys())[:MAX_DETAIL_LINES]:
             channels = spike_by_sample[idx]
             ts = timestamps[idx]
             sn = sample_nums[idx]
-            ch_list = [f"{ch}={val} (exp {exp:.0f})" for ch, val, exp in channels]
-            print(f"    Sample {sn:>7} (t={ts:.3f}s): {', '.join(ch_list)}")
+            # Summarize by port for readability with 224 channels
+            port_summary = {}
+            for ch, val, exp in channels:
+                port = parse_channel_name(ch)[0]
+                port_summary[port] = port_summary.get(port, 0) + 1
+            port_str = ', '.join(f"{p}({n}ch)" for p, n in sorted(port_summary.items()))
+            print(f"    Sample {sn:>7} (t={ts:.3f}s): {len(channels)} channels [{port_str}]")
 
             # Show bit-shift info if applicable
             if idx in bitshift_by_sample:
+                bs_summary = {}
                 for ch, val, exp, shift in bitshift_by_sample[idx]:
-                    print(f"      ^ {ch}: looks like {exp} >> {shift} = {exp >> shift} (got {val})")
+                    port = parse_channel_name(ch)[0]
+                    bs_summary[port] = bs_summary.get(port, 0) + 1
+                bs_str = ', '.join(f"{p}({n})" for p, n in sorted(bs_summary.items()))
+                print(f"      ^ bit-shift matches: [{bs_str}]")
 
-        if n_spikes > 10:
-            print(f"    ... and {n_spikes-10} more events")
+        if n_spikes > MAX_DETAIL_LINES:
+            print(f"    ... and {n_spikes-MAX_DETAIL_LINES} more events")
 
     n_bitshift = len(bitshift_by_sample)
     print(f"  Bit-shift matches:  {n_bitshift}")
@@ -241,14 +278,18 @@ def analyze_file(filepath):
     n_oor_samples = len(oor_by_sample)
     print(f"  Out-of-range:       {len(oor_events)} values in {n_oor_samples} samples (range [{RANGE_LOW}, {RANGE_HIGH}])")
     if oor_by_sample:
-        for idx in sorted(oor_by_sample.keys())[:10]:
+        for idx in sorted(oor_by_sample.keys())[:MAX_DETAIL_LINES]:
             channels = oor_by_sample[idx]
             ts = timestamps[idx]
             sn = sample_nums[idx]
-            ch_list = [f"{ch}={val}" for ch, val in channels]
-            print(f"    Sample {sn:>7} (t={ts:.3f}s): {', '.join(ch_list)}")
-        if n_oor_samples > 10:
-            print(f"    ... and {n_oor_samples-10} more events")
+            port_summary = {}
+            for ch, val in channels:
+                port = parse_channel_name(ch)[0]
+                port_summary[port] = port_summary.get(port, 0) + 1
+            port_str = ', '.join(f"{p}({n}ch)" for p, n in sorted(port_summary.items()))
+            print(f"    Sample {sn:>7} (t={ts:.3f}s): {len(channels)} channels [{port_str}]")
+        if n_oor_samples > MAX_DETAIL_LINES:
+            print(f"    ... and {n_oor_samples-MAX_DETAIL_LINES} more events")
 
     # --- Summary ---
     total_corrupted = total_spike_channels + len(rail_events) + len(oor_events)
@@ -265,16 +306,24 @@ def analyze_file(filepath):
 
         # Per-port breakdown
         port_counts = {}
+        dev_counts = {}
         for (idx, ch, val, exp) in spike_events:
-            port = ch.split('_')[0]
+            port, dev, _ = parse_channel_name(ch)
             port_counts[port] = port_counts.get(port, 0) + 1
+            dev_counts[dev] = dev_counts.get(dev, 0) + 1
         for (idx, ch, val) in oor_events:
-            port = ch.split('_')[0]
+            port, dev, _ = parse_channel_name(ch)
             port_counts[port] = port_counts.get(port, 0) + 1
+            dev_counts[dev] = dev_counts.get(dev, 0) + 1
         if port_counts:
             print(f"  By port:")
             for port in sorted(port_counts.keys()):
                 print(f"    {port}: {port_counts[port]} corrupted values")
+                # Show device breakdown within this port
+                port_devs = {d: c for d, c in sorted(dev_counts.items()) if d.startswith(port)}
+                if len(port_devs) > 1 or any(c != port_counts[port] for c in port_devs.values()):
+                    for dev in sorted(port_devs.keys()):
+                        print(f"      {dev}: {port_devs[dev]}")
 
     elapsed = time.time() - t_start
     print(f"\n  Analysis time: {elapsed:.1f}s")
@@ -284,12 +333,12 @@ def main():
     if len(sys.argv) > 1:
         files = sys.argv[1:]
     else:
-        default = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'all_ports_ch1_data.csv')
+        default = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'all_channels_data.csv')
         if os.path.exists(default):
             files = [default]
         else:
             print("Usage: python check_corruption.py <csv_file> [csv_file2 ...]")
-            print("  Or place all_ports_ch1_data.csv in the same directory.")
+            print("  Or place all_channels_data.csv in the data/ directory.")
             sys.exit(1)
 
     for f in files:

@@ -13,6 +13,7 @@ namespace ads1299 {
 class ADS1299Device;
 class BusWorker;
 class DRDYPoller;
+class StreamingServer;
 
 // Real-time acquisition hot loop.
 // Pins to core 3, sets SCHED_FIFO priority 50, zero heap allocation in hot loop.
@@ -23,6 +24,9 @@ public:
                       std::vector<BusWorker*>& workers,
                       DRDYPoller& drdy_poller,
                       SPSCRing<Sample>& ring);
+
+    // Set optional TCP streaming server (called before run())
+    void set_streaming_server(StreamingServer* s) { streaming_ = s; }
 
     // Run the hot loop until running flag is cleared (by signal handler)
     void run(volatile sig_atomic_t& running);
@@ -54,6 +58,7 @@ private:
     std::vector<BusWorker*>& workers_;
     DRDYPoller& drdy_poller_;
     SPSCRing<Sample>& ring_;
+    StreamingServer* streaming_ = nullptr;
 
     PortWorkerMap port_map_[MAX_PORTS];
     int num_ports_;

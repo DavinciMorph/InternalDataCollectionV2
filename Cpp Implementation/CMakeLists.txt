@@ -34,6 +34,8 @@ set(SOURCES
     src/acquisition/bus_worker.cpp
     src/acquisition/drdy_poller.cpp
     src/logging/csv_writer.cpp
+    src/streaming/protocol.cpp
+    src/streaming/server.cpp
 )
 
 add_executable(ads1299_acquire ${SOURCES})
@@ -42,4 +44,10 @@ target_include_directories(ads1299_acquire PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
 # Link pthreads
 find_package(Threads REQUIRED)
-target_link_libraries(ads1299_acquire PRIVATE Threads::Threads)
+
+# Find LZ4 (liblz4-dev must be installed: apt install liblz4-dev)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LZ4 REQUIRED liblz4)
+
+target_include_directories(ads1299_acquire PRIVATE ${LZ4_INCLUDE_DIRS})
+target_link_libraries(ads1299_acquire PRIVATE Threads::Threads ${LZ4_LIBRARIES})

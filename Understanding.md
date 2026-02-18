@@ -358,3 +358,58 @@ The max dt of 4.66 ms is only 0.66 ms past the sample period — well within tol
 
 ### Conclusion
 The C++ rewrite eliminates the Python-specific corruption mechanism. Zero corruption over 349k samples (23 minutes) validates that the architecture — direct SPI ioctl, true parallelism, deterministic memory, RT scheduling — provides sufficient headroom to absorb OS scheduling jitter without data loss.
+
+---
+
+## Phase 2 Results: C++ TCP Streaming (Phase 2 — Acquisition + CSV + TCP)
+
+### What Was Built
+Added TCP streaming as a parallel output path alongside CSV, wire-compatible with the existing `simpleviz.py` Python client. No client-side changes required. The acquisition hot loop's only touch point is a single non-blocking `try_push()` to a second SPSC ring buffer.
+
+New source files: `include/streaming/{protocol,server}.hpp`, `src/streaming/{protocol,server}.cpp`
+
+### Architecture
+- **Separate SPSC ring** (2048 slots): Streaming has its own ring buffer, independent from the CSV ring. A slow or disconnected client cannot affect CSV writes or vice versa.
+- **Accept thread** (core 1, SCHED_OTHER): Listens for TCP connections via `poll()` + `accept()`. Hands off new client fd to the streaming thread via atomic exchange.
+- **Streaming thread** (core 2, SCHED_OTHER): Pops samples from ring, packs into wire format, compresses with LZ4 streaming API, sends as framed binary data. Handles reconnection, ring drain, partial batch flush.
+- **LZ4 streaming API**: Uses `LZ4F_compressBegin/Update/End` with a context allocated once at startup — zero per-call memory allocations (unlike `LZ4F_compressFrame()` which mallocs internally).
+- **Wire protocol**: Metadata JSON (once per connection) + `[u32 compressed_size][u32 sample_count][LZ4 frame]` — byte-for-byte compatible with `simpleviz.py`.
+- **Fault isolation**: `SIGPIPE` ignored, `MSG_NOSIGNAL` on all sends, TCP keepalive (`KEEPIDLE=10, KEEPINTVL=5, KEEPCNT=3`), periodic non-blocking `recv()` for fast disconnect detection.
+
+### Configuration
+7 SPI ports, 4 daisy-chained ADS1299 devices per port, 28 devices total, 224 channels @ 250 Hz. Default streaming on `0.0.0.0:8888`. Configurable via `--host` and `--port` arguments.
+
+### Validation Run
+| Metric | Result |
+|--------|--------|
+| Duration | 20.6 minutes (1234.6 s) |
+| Samples | 308,491 |
+| Channels | 224 (7 ports x 4 devices x 8 channels) |
+| Sample rate | 250.0 Hz (locked, 249.9 Hz measured) |
+| Corruption events | **0** |
+| DRDY timeouts | 0 |
+| CSV ring drops | 0 |
+| Stream ring drops | **0** |
+| Stream samples sent | 307,150 (99.6% — rest in flight at shutdown) |
+| Stream batches | 30,715 |
+| Reconnects | 1 |
+| Cycle time (min/mean/max) | 0.35 / 0.36 / 0.73 ms |
+| Sample dt (min/max) | 1.89 / 4.25 ms |
+
+### Key Observations
+- **Zero drops across entire run**: The streaming ring never dropped a single sample over 308k samples. Ring queue depth stayed at 0-2 samples throughout, confirming the streaming thread keeps up effortlessly.
+- **Client disconnect handled cleanly**: Client disconnected at ~1233s (`[STREAM] Send failed -- client disconnected`), server continued running and shut down cleanly via Ctrl+C 1s later.
+- **No impact on acquisition timing**: Cycle time (0.36ms mean) and dt range (1.89-4.25ms) are identical to Phase 1 CSV-only results, confirming the second ring push adds negligible overhead.
+- **Port6 recovered**: Port6 (SPI4.1/CS1) which was stuck at all-zeros in previous runs initialized and streamed successfully in this run.
+- **Init needed restarts**: 6/7 ports returned zeros initially, all recovered via per-port restart during warmup. This is the expected behavior for the V2 board.
+
+### Comparison with Python Streaming
+| Metric | Python Server | C++ Server |
+|--------|--------------|------------|
+| Client receive rate | ~108 Hz | **250 Hz (full rate)** |
+| Stream drops | Frequent (queue overflow) | **0** |
+| Backpressure risk | High (TCP stalls corrupt SPI) | **None** (isolated ring) |
+| Per-batch overhead | GIL + struct.pack + lz4.frame | Pre-allocated memcpy + LZ4F streaming |
+
+### Conclusion
+Phase 2 TCP streaming is validated. Zero corruption, zero drops, full 250 Hz delivery to the client, clean disconnect/reconnect handling, and no measurable impact on acquisition timing. The system is now feature-complete for real-time 224-channel EEG acquisition with simultaneous CSV recording and live TCP streaming.

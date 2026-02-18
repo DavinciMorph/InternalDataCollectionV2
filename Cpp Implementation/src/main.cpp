@@ -10,6 +10,7 @@
 #include "acquisition/drdy_poller.hpp"
 #include "logging/csv_writer.hpp"
 #include "logging/spsc_ring.hpp"
+#include "streaming/server.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -39,8 +40,10 @@ static void sleep_sec(double sec) {
 struct Args {
     ads1299::PortConfig ports[ads1299::MAX_PORTS];
     int num_ports = 0;
-    bool full_csv = true;  // Default: full 224-channel CSV
-    int duration_sec = 0;  // 0 = run until Ctrl+C
+    bool full_csv = true;   // Default: full 224-channel CSV
+    int duration_sec = 0;   // 0 = run until Ctrl+C
+    char host[64] = "0.0.0.0";
+    int port = 8888;
 };
 
 static bool parse_port(const char* str, ads1299::PortConfig& out) {
@@ -94,10 +97,16 @@ static Args parse_args(int argc, char* argv[]) {
             args.full_csv = false;
         } else if (std::strcmp(argv[i], "--duration") == 0 && i + 1 < argc) {
             args.duration_sec = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
+        } else if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
+            std::strncpy(args.host, argv[++i], sizeof(args.host) - 1);
+        } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            args.port = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             std::printf("Usage: %s [--ports bus,dev,name,num_daisy ...] "
-                        "[--full-csv] [--no-csv] [--duration SEC]\n\n"
-                        "Default: 7 ports x 4 devices = 224 channels @ 250 Hz\n\n"
+                        "[--full-csv] [--no-csv] [--duration SEC] "
+                        "[--host ADDR] [--port PORT]\n\n"
+                        "Default: 7 ports x 4 devices = 224 channels @ 250 Hz\n"
+                        "         TCP streaming on 0.0.0.0:8888\n\n"
                         "Port format: bus,device,name,num_daisy\n"
                         "  bus: SPI bus (0, 3, 4, 5)\n"
                         "  device: SPI device (0-1)\n"
@@ -129,12 +138,17 @@ int main(int argc, char* argv[]) {
     int total_channels = total_devices * ads1299::CHANNELS_PER_DEVICE;
 
     std::printf("\n============================================================\n"
-                "ADS1299 C++ ACQUISITION ENGINE (Phase 1)\n"
+                "ADS1299 C++ ACQUISITION ENGINE (Phase 2: TCP Streaming)\n"
                 "============================================================\n"
-                "Config: %d ports, %d devices, %d channels @ 250Hz\n\n",
-                args.num_ports, total_devices, total_channels);
+                "Config: %d ports, %d devices, %d channels @ 250Hz\n"
+                "Stream: %s:%d\n\n",
+                args.num_ports, total_devices, total_channels,
+                args.host, args.port);
 
     // --- Signal handling ---
+    // SIGPIPE: disconnected TCP client must not kill the process
+    signal(SIGPIPE, SIG_IGN);
+
     struct sigaction sa{};
     sa.sa_handler = signal_handler;
     sigemptyset(&sa.sa_mask);
@@ -342,12 +356,18 @@ int main(int argc, char* argv[]) {
                     total_channels);
     }
 
+    // --- Create streaming server ---
+    ads1299::StreamingServer streaming_server(args.ports, args.num_ports,
+                                             total_channels, total_devices);
+    streaming_server.start(args.host, args.port);
+
     // --- Create and run acquisition engine ---
     std::printf("\n============================================================\n"
                 "ACQUISITION RUNNING - Ctrl+C to stop\n"
                 "============================================================\n\n");
 
     ads1299::AcquisitionEngine engine(devices, workers, drdy_poller, *ring);
+    engine.set_streaming_server(&streaming_server);
 
     // If duration specified, set up a timer thread
     if (args.duration_sec > 0) {
@@ -369,6 +389,9 @@ int main(int argc, char* argv[]) {
         w->stop();
     }
 
+    // Stop streaming server (drains ring, joins threads)
+    streaming_server.stop();
+
     // Stop CSV writer (drains remaining, flushes, closes)
     if (csv_writer) {
         csv_writer->stop();
@@ -384,6 +407,8 @@ int main(int argc, char* argv[]) {
     auto stats = engine.get_stats();
     double rate = stats.runtime_sec > 0 ? stats.total_samples / stats.runtime_sec : 0;
 
+    auto ss = streaming_server.get_stats();
+
     std::printf("\n============================================================\n"
                 "FINAL STATISTICS\n"
                 "============================================================\n"
@@ -396,6 +421,7 @@ int main(int argc, char* argv[]) {
                 "Corruptions:    %lu\n"
                 "Ring drops:     %lu\n"
                 "CSV written:    %lu\n"
+                "Stream sent:    %lu (batches: %lu, drops: %lu, reconnects: %lu)\n"
                 "============================================================\n\n",
                 static_cast<unsigned long>(stats.total_samples),
                 stats.runtime_sec,
@@ -405,7 +431,11 @@ int main(int argc, char* argv[]) {
                 static_cast<unsigned long>(stats.drdy_timeouts),
                 static_cast<unsigned long>(stats.corruption_count),
                 static_cast<unsigned long>(stats.drop_count),
-                csv_writer ? static_cast<unsigned long>(csv_writer->total_written()) : 0UL);
+                csv_writer ? static_cast<unsigned long>(csv_writer->total_written()) : 0UL,
+                static_cast<unsigned long>(ss.samples_sent),
+                static_cast<unsigned long>(ss.batches_sent),
+                static_cast<unsigned long>(ss.drops),
+                static_cast<unsigned long>(ss.reconnects));
 
     std::printf("System shutdown complete\n");
     return 0;

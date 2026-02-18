@@ -3,6 +3,7 @@
 #include "acquisition/drdy_poller.hpp"
 #include "ads1299/spi_device.hpp"
 #include "ads1299/registers.hpp"
+#include "streaming/server.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -78,6 +79,16 @@ void AcquisitionEngine::print_stats() {
                 static_cast<unsigned long>(drdy_timeouts_),
                 static_cast<unsigned long>(corruption_count_),
                 static_cast<unsigned long>(drop_count_));
+
+    if (streaming_) {
+        auto ss = streaming_->get_stats();
+        std::printf("           stream: sent=%lu batches=%lu drops=%lu queued=%zu %s\n",
+                    static_cast<unsigned long>(ss.samples_sent),
+                    static_cast<unsigned long>(ss.batches_sent),
+                    static_cast<unsigned long>(ss.drops),
+                    ss.ring_queued,
+                    ss.connected ? "[connected]" : "[no client]");
+    }
 }
 
 void AcquisitionEngine::run(volatile sig_atomic_t& running) {
@@ -172,9 +183,14 @@ void AcquisitionEngine::run(volatile sig_atomic_t& running) {
             }
         }
 
-        // 5. Non-blocking push to SPSC ring buffer
+        // 5. Non-blocking push to SPSC ring buffer (CSV)
         if (!ring_.try_push(sample)) {
             drop_count_++;
+        }
+
+        // 5b. Non-blocking push to streaming ring buffer (TCP)
+        if (streaming_) {
+            streaming_->push_sample(sample);
         }
 
         // 6. Timing instrumentation
