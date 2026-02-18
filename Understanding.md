@@ -265,21 +265,45 @@ All devices share MOSI — single SDATAC reaches all 4 simultaneously. SDATAC ve
 ### Test 12 (REVISED): Parallelize port init across independent SPI buses
 **Change:** Init ports on different SPI buses concurrently (SPI0/SPI3/SPI4/SPI5 are independent HW)
 **Risk:** MEDIUM | **Expected savings:** ~6.5-13s (4 buses in parallel vs 7 ports sequential)
-SPI objects already constructed sequentially. Only `initialize_device()` calls parallelized (pure SPI, no I2C). START pins pre-set LOW by `force_all_start_pins_low()`.
+| **Result: REVERTED**
 
 | Run | Samples | Corrupt | Result | Notes |
 |-----|---------|---------|--------|-------|
-| 1   |         |         |        |       |
-| 2   |         |         |        |       |
+| 1   | 0       | N/A     | FAIL   | Port4 read Device ID 0x20. Init abort. |
+| 2   | 69,252  | 12      | FAIL   | First real corruption in testing. 12.1ms stall at sample 14130, 3 ports hit simultaneously (Port1/3/5). |
+
+**Reverted.** Run 1: Port4 ID read 0x20 (also happened on sequential — may be pre-existing). Run 2: System-wide stall caused corruption across 3 independent SPI buses. Not worth the risk for ~6.5s savings.
 
 ---
 
-### Final Validation (after all A/B tests)
-| Run | Duration | Samples | Corrupt | Init Time | Result |
-|-----|----------|---------|---------|-----------|--------|
-| 1   | 5 min    |         |         |           |        |
-| 2   | 5 min    |         |         |           |        |
-| 3   | 5 min    |         |         |           |        |
-| 4   | 5 min    |         |         |           |        |
-| 5   | 5 min    |         |         |           |        |
-| 6   | 20 min   |         |         |           |        |
+### Phase 1 Summary
+
+**Accepted optimizations (cumulative savings ~58s from original ~60s fixed delays):**
+1. `num_resets`: 5 → 2 (Test 3, ~29.4s saved)
+2. `reset_time`: `1.0+(N*0.1)` → `0.1+(N*0.01)` (Test 5, ~17.6s saved)
+3. Reference buffer settling: 500ms → 200ms (Test 6, ~2.1s saved)
+4. Post-RDATAC settling: 750ms → 200ms (Test 7, ~0.55s saved)
+5. Post-START sync wait: 500ms → 100ms (Test 8, ~0.4s saved)
+6. `write_and_verify` sleep: 100ms → 10ms (Test 10, ~8.2s saved)
+
+**Reverted (caused issues):**
+- Test 9: Remove 1000ms stabilization + 2nd DRDY check — increased init failures
+- Test 11: Reduce SDATAC sends 6→2 — increased init failures
+- Test 12: Parallel port init — caused real data corruption + init failures
+
+**Note:** TCP streaming is disabled for testing isolation. CSV-only output.
+
+### Final Validation
+| Run | Duration | Samples | Corrupt | Result | Notes |
+|-----|----------|---------|---------|--------|-------|
+| 1   | 21.6 min | 323,750 | 14 (1 sample) | NEAR-PASS | 250.0 Hz, 8.2ms stall at sample 215335. 3 ports hit (Port2/5/7). 0.000154% corruption rate. |
+
+**Conclusion:** Init optimizations are solid — zero corruption across all 5-min A/B tests. The single corruption event in the 20-min run was caused by an 8.2ms stall (barely 2x the 4ms sample period). This is the fundamental Python limitation: GIL + spidev kernel overhead leaves near-zero headroom for OS scheduling jitter.
+
+---
+
+## Phase 2: C++ Hot Loop Migration
+
+**Goal:** Migrate the SPI acquisition hot loop from Python to C++ to dramatically reduce per-read overhead and increase headroom against OS scheduling jitter.
+
+**Rationale:** The 8.2ms stall that caused corruption in the final validation was only 2x the sample period. Python's GIL, spidev ioctl overhead, and interpreted execution leave ~0.5-1ms margin. C++ with direct SPI access should reduce per-sample read time significantly, providing enough headroom to absorb these stalls without data corruption.

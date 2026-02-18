@@ -1831,7 +1831,7 @@ Port format: bus,device,name,num_daisy
 
     config = ADS1299_Config()
     
-    # Configure each device (single attempt each - no retries)
+    # Configure each device sequentially
     for spi_dev in spi_devices:
         success, _ = ADS1299_Controller.initialize_device(spi_dev, config)
         if not success:
