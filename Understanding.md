@@ -307,3 +307,54 @@ All devices share MOSI — single SDATAC reaches all 4 simultaneously. SDATAC ve
 **Goal:** Migrate the SPI acquisition hot loop from Python to C++ to dramatically reduce per-read overhead and increase headroom against OS scheduling jitter.
 
 **Rationale:** The 8.2ms stall that caused corruption in the final validation was only 2x the sample period. Python's GIL, spidev ioctl overhead, and interpreted execution leave ~0.5-1ms margin. C++ with direct SPI access should reduce per-sample read time significantly, providing enough headroom to absorb these stalls without data corruption.
+
+---
+
+## Phase 2 Results: C++ Acquisition Engine (Phase 1 — Acquisition + CSV)
+
+### What Was Built
+Complete C++20 rewrite of the Python acquisition hot loop, targeting the Raspberry Pi 4 (BCM2711 / Cortex-A72). Covers device initialization, real-time parallel SPI acquisition, and async CSV logging. TCP streaming (Phase 2 of the C++ rewrite) is not yet implemented.
+
+Source: `Cpp Implementation/` (22 source files across 4 modules)
+
+### Architecture
+- **Direct SPI ioctl**: `ioctl(SPI_IOC_MESSAGE)` replaces Python's `spidev.xfer2()`, eliminating per-call GIL/object-allocation overhead
+- **eventfd-triggered bus workers**: One persistent thread per physical SPI bus (4 buses), signaled via `eventfd` for minimal-latency wakeup. Ports on the same bus are read sequentially; buses execute truly in parallel (no GIL)
+- **SPSC lock-free ring buffer**: Single-producer (acquisition thread) single-consumer (CSV writer thread) bounded ring for zero-contention sample handoff
+- **SCHED_FIFO 50 on core 3**: Acquisition thread pinned to isolated core with real-time priority, `mlockall(MCL_CURRENT | MCL_FUTURE)` to prevent page faults
+- **Zero heap allocation in hot loop**: All SPI buffers, parse buffers, and sample structs pre-allocated at startup
+- **Faithful init port**: All Python retry loops, SDATAC verification, warmup/restart/re-sync sequences preserved exactly
+
+### Build & Deploy
+- Built natively on Pi with GCC 14.2
+- Flags: `-std=c++20 -mcpu=cortex-a72 -O2 -fno-exceptions -fno-rtti`, LTO enabled
+- Binary: `~/ads1299-cpp/build/ads1299_acquire` (79 KB), requires `sudo` for SCHED_FIFO and SPI/I2C access
+
+### First Validation Run
+| Metric | Result |
+|--------|--------|
+| Duration | 23.3 minutes |
+| Samples | 349,369 |
+| Channels | 224 (7 ports × 4 devices × 8 channels) |
+| Sample rate | 250.0 Hz (locked) |
+| Gaps | 0 |
+| Corruption events | **0** |
+| Jitter events (>2× period) | 0 |
+| dt mean | 4.000 ms |
+| dt min | 1.241 ms |
+| dt max | 4.660 ms |
+| Normal samples | 100% |
+
+### Comparison with Python Baseline
+| Metric | Python | C++ |
+|--------|--------|-----|
+| Max dt | 8.2 ms (caused corruption) | 4.66 ms |
+| Typical cycle time | 2.5–3.0 ms | < 1.0 ms |
+| Headroom per cycle | 1.0–1.5 ms | > 3.0 ms |
+| Corruption (20+ min run) | 1 event (14 values) | **0** |
+| GC/GIL stalls | Yes (mitigated with gc.disable) | N/A |
+
+The max dt of 4.66 ms is only 0.66 ms past the sample period — well within tolerance since the next DRDY hasn't been missed. Python's 8.2 ms stall exceeded 2× the period, missing a DRDY edge entirely.
+
+### Conclusion
+The C++ rewrite eliminates the Python-specific corruption mechanism. Zero corruption over 349k samples (23 minutes) validates that the architecture — direct SPI ioctl, true parallelism, deterministic memory, RT scheduling — provides sufficient headroom to absorb OS scheduling jitter without data loss.
