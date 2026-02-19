@@ -165,7 +165,7 @@ StreamingServer::Stats StreamingServer::get_stats() const {
     return s;
 }
 
-// Accept thread: pinned core 1, SCHED_OTHER
+// Accept thread: pinned core 1 (housekeeping core, shared with stream thread + CSV writer)
 void StreamingServer::accept_loop() {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
@@ -223,11 +223,11 @@ void StreamingServer::accept_loop() {
     }
 }
 
-// Streaming thread: pinned core 2, SCHED_OTHER
+// Streaming thread: pinned core 1, SCHED_OTHER
 void StreamingServer::stream_loop() {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
-    CPU_SET(2, &cpuset);
+    CPU_SET(1, &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 
     Sample sample;

@@ -8,9 +8,9 @@ namespace ads1299 {
 
 // Maximum system dimensions
 constexpr int MAX_PORTS          = 7;
-constexpr int MAX_DEVICES_PER_PORT = 4;
+constexpr int MAX_DEVICES_PER_PORT = 9;
 constexpr int CHANNELS_PER_DEVICE = 8;
-constexpr int MAX_TOTAL_CHANNELS = MAX_PORTS * MAX_DEVICES_PER_PORT * CHANNELS_PER_DEVICE;  // 224
+constexpr int MAX_TOTAL_CHANNELS = MAX_PORTS * MAX_DEVICES_PER_PORT * CHANNELS_PER_DEVICE;  // 504
 
 // Configuration for a single SPI port (maps to one daisy chain)
 struct PortConfig {
@@ -38,14 +38,14 @@ struct alignas(8) Sample {
     uint16_t num_channels;                              // 2 bytes
     bool     valid;                                     // 1 byte
     uint8_t  _pad;                                      // 1 byte
-    std::array<int32_t, MAX_TOTAL_CHANNELS> channels;   // 896 bytes
-    // Total: ~912 bytes
+    std::array<int32_t, MAX_TOTAL_CHANNELS> channels;   // 2016 bytes
+    // Total: ~2032 bytes
 };
-static_assert(sizeof(Sample) <= 1024, "Sample too large");
+static_assert(sizeof(Sample) <= 2048, "Sample too large");
 
 // Per-port raw data and parsed results
 struct PortData {
-    static constexpr int MAX_RAW_BYTES = MAX_DEVICES_PER_PORT * 27;  // 108
+    static constexpr int MAX_RAW_BYTES = MAX_DEVICES_PER_PORT * 27;  // 243
 
     uint8_t raw[MAX_RAW_BYTES];
     int     raw_len;
@@ -113,7 +113,7 @@ inline bool make_port_config(int bus, int device, const char* name, int num_dais
     return true;
 }
 
-// Default 7-port configuration: all ports with 4 daisy-chained devices
+// Default 7-port configuration: 41 devices across 7 ports
 struct DefaultPortConfigs {
     PortConfig ports[MAX_PORTS];
     int count;
@@ -121,13 +121,13 @@ struct DefaultPortConfigs {
     DefaultPortConfigs() : count(0) {
         struct Entry { int bus; int dev; const char* name; int num_daisy; };
         const Entry defaults[] = {
-            {0, 0, "Port1", 4},
-            {0, 1, "Port2", 4},
-            {3, 0, "Port3", 4},
+            {0, 0, "Port1", 9},
+            {0, 1, "Port2", 7},
+            {3, 0, "Port3", 5},
             {3, 1, "Port4", 4},
             {4, 0, "Port5", 4},
-            {4, 1, "Port6", 4},
-            {5, 0, "Port7", 4},
+            {4, 1, "Port6", 5},
+            {5, 0, "Port7", 7},
         };
 
         for (const auto& e : defaults) {

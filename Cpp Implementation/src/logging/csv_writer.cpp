@@ -3,6 +3,8 @@
 #include <charconv>
 #include <cstdio>
 #include <cstring>
+#include <pthread.h>
+#include <sched.h>
 #include <time.h>
 
 namespace ads1299 {
@@ -96,6 +98,13 @@ void CSVWriter::stop() {
 }
 
 void CSVWriter::run() {
+    // Pin CSV writer to core 1 (housekeeping core, shared with SPI3 worker + streaming)
+    // Core 2 is now isolated for SPI4/SPI5 bus workers only
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(1, &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+
     Sample sample;
 
     // Timing for idle sleep

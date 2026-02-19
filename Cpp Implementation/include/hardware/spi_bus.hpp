@@ -36,7 +36,7 @@ private:
 
     // Pre-allocated zero TX buffer for read_raw() — drives MOSI with zeros
     // (proven better than floating MOSI in A/B testing: 14 vs 96 corrupt values)
-    static constexpr size_t MAX_RAW_BYTES = 4 * 27;  // 108 bytes max
+    static constexpr size_t MAX_RAW_BYTES = 9 * 27;  // 243 bytes max (MAX_DEVICES_PER_PORT * 27)
     uint8_t zero_tx_[MAX_RAW_BYTES];
 
     // Pre-initialized transfer struct for hot path (read_raw)

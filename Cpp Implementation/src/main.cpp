@@ -12,12 +12,15 @@
 #include "logging/spsc_ring.hpp"
 #include "streaming/server.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <csignal>
 #include <memory>
 #include <vector>
+#include <pthread.h>
+#include <sched.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -40,7 +43,7 @@ static void sleep_sec(double sec) {
 struct Args {
     ads1299::PortConfig ports[ads1299::MAX_PORTS];
     int num_ports = 0;
-    bool full_csv = true;   // Default: full 224-channel CSV
+    bool full_csv = false;  // Default: no CSV (client-side recording)
     int duration_sec = 0;   // 0 = run until Ctrl+C
     char host[64] = "0.0.0.0";
     int port = 8888;
@@ -105,8 +108,9 @@ static Args parse_args(int argc, char* argv[]) {
             std::printf("Usage: %s [--ports bus,dev,name,num_daisy ...] "
                         "[--full-csv] [--no-csv] [--duration SEC] "
                         "[--host ADDR] [--port PORT]\n\n"
-                        "Default: 7 ports x 4 devices = 224 channels @ 250 Hz\n"
-                        "         TCP streaming on 0.0.0.0:8888\n\n"
+                        "Default: 7 ports x 41 devices = 328 channels @ 250 Hz\n"
+                        "         TCP streaming on 0.0.0.0:8888\n"
+                        "         CSV disabled (use --full-csv to enable server-side CSV)\n\n"
                         "Port format: bus,device,name,num_daisy\n"
                         "  bus: SPI bus (0, 3, 4, 5)\n"
                         "  device: SPI device (0-1)\n"
@@ -217,54 +221,279 @@ int main(int argc, char* argv[]) {
         spi_buses.push_back(std::move(spi));
     }
 
-    // --- Configure all devices ---
+    // --- Phase 1: Configure all devices (register writes) ---
+    // This always succeeds if hardware is present. Do it once.
     std::printf("\n============================================================\n"
-                "CONFIGURING DEVICES\n"
+                "PHASE 1: CONFIGURING DEVICES (registers)\n"
                 "============================================================\n");
 
     ads1299::DeviceConfig config;
 
     for (int i = 0; i < args.num_ports; ++i) {
+        if (!g_running) {
+            std::printf("\n[CANCELLED] Ctrl+C during configuration\n");
+            return 1;
+        }
         bool success = ads1299::ADS1299Controller::initialize_device(*devices[i], config);
         if (!success) {
-            std::fprintf(stderr, "\n[FAIL] %s failed to initialize\n",
+            std::fprintf(stderr, "\n[FAIL] %s failed to configure registers\n",
                          devices[i]->config().port_name);
+            std::fprintf(stderr, "This is a hardware failure, not the RDATAC timing race.\n");
             return 1;
         }
-        sleep_sec(0.1);  // Gap between ports
+        sleep_sec(0.1);
+    }
+    std::printf("\n[OK] All %d ports configured successfully (registers verified)\n",
+                args.num_ports);
+
+    if (!g_running) {
+        std::printf("\n[CANCELLED] Ctrl+C after configuration\n");
+        return 1;
     }
 
-    std::printf("\n[OK] All devices configured successfully!\n");
-
-    // --- Start conversions ---
+    // --- Phase 2: Start conversions + per-port recovery ---
+    // RDATAC + START has a ~10% per-port failure rate (timing race).
+    // Strategy: start all, verify each, recover only failing ports.
     std::printf("\n============================================================\n"
-                "VERIFYING DATA FLOW\n"
+                "PHASE 2: STARTING CONVERSIONS + VERIFICATION\n"
                 "============================================================\n");
 
-    bool data_flow_ok = ads1299::ADS1299Controller::start_all_conversions_synchronized(
-        devices, i2c, &config);
+    ads1299::PortHealth port_health[ads1299::MAX_PORTS] = {};
 
-    if (!data_flow_ok) {
-        std::printf("\n[WARN] Data flow verification had issues\n");
-        // Check if DRDY is at least active
-        bool drdy_active = false;
-        for (auto* dev : devices) {
-            if (dev->wait_for_drdy(0.1)) {
-                drdy_active = true;
+    // Start all ports and get initial health status
+    ads1299::ADS1299Controller::start_and_verify(devices, i2c, port_health, g_running);
+
+    if (!g_running) {
+        std::printf("\n[CANCELLED] Ctrl+C during start\n");
+        return 1;
+    }
+
+    // Count initial results
+    int healthy_count = 0;
+    int failing_count = 0;
+    for (int p = 0; p < args.num_ports; ++p) {
+        if (port_health[p].healthy) {
+            healthy_count++;
+        } else {
+            failing_count++;
+        }
+    }
+    std::printf("\n  Initial result: %d/%d ports healthy", healthy_count, args.num_ports);
+    if (failing_count > 0) {
+        std::printf(" (%d need recovery)", failing_count);
+    }
+    std::printf("\n");
+
+    // --- Phase 3: Per-port recovery for failing ports ---
+    // Only failing ports are cycled. Working ports are never touched.
+    constexpr int MAX_RECOVERY_ATTEMPTS = 15;
+    bool port_dead[ads1299::MAX_PORTS] = {};  // true = gave up on this port
+
+    if (failing_count > 0) {
+        std::printf("\n  --- Per-port recovery (max %d attempts each) ---\n",
+                    MAX_RECOVERY_ATTEMPTS);
+    }
+
+    for (int p = 0; p < args.num_ports; ++p) {
+        if (port_health[p].healthy) continue;  // Skip healthy ports
+        if (!g_running) break;
+
+        auto* dev = devices[p];
+        bool recovered = false;
+
+        for (int attempt = 0; attempt < MAX_RECOVERY_ATTEMPTS; ++attempt) {
+            if (!g_running) break;
+
+            bool ok = ads1299::ADS1299Controller::recover_port(*dev, attempt, 10);
+            if (ok) {
+                std::printf("    %s: recovered on attempt %d [OK]\n",
+                            dev->config().port_name, attempt + 1);
+                port_health[p].healthy = true;
+                port_health[p].drdy_active = true;
+                healthy_count++;
+                failing_count--;
+                recovered = true;
                 break;
             }
+
+            // Brief log every few attempts
+            if (attempt == 2 || attempt == 5 || attempt == 9 || attempt == 14) {
+                std::printf("    %s: still failing after %d attempts...\n",
+                            dev->config().port_name, attempt + 1);
+            }
         }
-        if (drdy_active) {
-            std::printf("DRDY active - continuing...\n");
-        } else {
-            std::fprintf(stderr, "DRDY NOT active - aborting\n");
-            return 1;
+
+        if (!recovered && g_running) {
+            port_dead[p] = true;
+            failing_count--;
+            std::printf("    %s: DEAD after %d attempts - skipping\n",
+                        dev->config().port_name, MAX_RECOVERY_ATTEMPTS);
+            // Shut down the dead port cleanly
+            dev->start_low();
+            dev->send_command(ads1299::Cmd::STOP);
+            dev->send_command(ads1299::Cmd::SDATAC);
         }
-    } else {
-        std::printf("\n============================================================\n"
-                    "[OK] SYSTEM INITIALIZATION COMPLETE!\n"
-                    "============================================================\n");
     }
+
+    if (!g_running) {
+        std::printf("\n[CANCELLED] Ctrl+C during recovery\n");
+        return 1;
+    }
+
+    // --- Phase 4: Warmup + final health check ---
+    std::printf("\n  --- Warmup: discarding 100 settling samples ---\n");
+
+    // Find a healthy reference port for DRDY timing
+    ads1299::ADS1299Device* ref_port = nullptr;
+    for (int p = 0; p < args.num_ports; ++p) {
+        if (port_health[p].healthy) {
+            if (!ref_port || devices[p]->config().num_devices > ref_port->config().num_devices) {
+                ref_port = devices[p];
+            }
+        }
+    }
+
+    if (!ref_port) {
+        std::fprintf(stderr, "\n[FAIL] No healthy ports available\n");
+        return 1;
+    }
+
+    // Discard 100 warmup samples (read from all healthy ports)
+    for (int i = 0; i < 100 && g_running; ++i) {
+        if (ref_port->wait_for_drdy(0.02)) {
+            for (int p = 0; p < args.num_ports; ++p) {
+                if (!port_dead[p]) {
+                    ads1299::PortData pd;
+                    devices[p]->read_data(pd);
+                }
+            }
+        }
+    }
+
+    if (!g_running) {
+        std::printf("\n[CANCELLED] Ctrl+C during warmup\n");
+        return 1;
+    }
+
+    // Final health check: 50 samples, verify all healthy ports are still healthy
+    std::printf("  --- Final health check (50 samples) ---\n");
+
+    int final_valid[ads1299::MAX_PORTS] = {};
+    int final_reads = 0;
+
+    for (int i = 0; i < 50 && g_running; ++i) {
+        if (ref_port->wait_for_drdy(0.02)) {
+            final_reads++;
+            for (int p = 0; p < args.num_ports; ++p) {
+                if (port_dead[p]) continue;
+                ads1299::PortData pd;
+                devices[p]->read_data(pd);
+
+                bool ok = true;
+                for (int d = 0; d < devices[p]->config().num_devices; ++d) {
+                    if ((pd.status_bytes[d][0] & 0xF0) != 0xC0) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (ok) final_valid[p]++;
+            }
+        }
+    }
+
+    // Report and handle any ports that degraded during warmup
+    int active_ports = 0;
+    for (int p = 0; p < args.num_ports; ++p) {
+        if (port_dead[p]) {
+            std::printf("    %s: DEAD (skipped)\n", devices[p]->config().port_name);
+            continue;
+        }
+
+        double rate = final_reads > 0 ? static_cast<double>(final_valid[p]) / final_reads : 0;
+        if (rate >= 0.90) {
+            std::printf("    %s: %.0f%% valid (%d/%d) [OK]\n",
+                        devices[p]->config().port_name, rate * 100.0,
+                        final_valid[p], final_reads);
+            active_ports++;
+        } else if (rate == 0 && final_reads > 10) {
+            // Port regressed to zeros during warmup — one more recovery attempt
+            std::printf("    %s: 0%% valid — attempting final recovery...\n",
+                        devices[p]->config().port_name);
+            bool last_chance = false;
+            for (int a = 0; a < 5 && g_running; ++a) {
+                if (ads1299::ADS1299Controller::recover_port(*devices[p], a, 10)) {
+                    std::printf("    %s: recovered [OK]\n", devices[p]->config().port_name);
+                    last_chance = true;
+                    break;
+                }
+            }
+            if (last_chance) {
+                active_ports++;
+            } else {
+                port_dead[p] = true;
+                std::printf("    %s: DEAD after final recovery attempt\n",
+                            devices[p]->config().port_name);
+                devices[p]->start_low();
+                devices[p]->send_command(ads1299::Cmd::STOP);
+                devices[p]->send_command(ads1299::Cmd::SDATAC);
+            }
+        } else if (rate >= 0.50) {
+            // Majority valid — keep it, it may stabilize during acquisition
+            std::printf("    %s: %.0f%% valid (%d/%d) [WARN - keeping]\n",
+                        devices[p]->config().port_name, rate * 100.0,
+                        final_valid[p], final_reads);
+            active_ports++;
+        } else {
+            // Below 50% valid — attempt recovery
+            std::printf("    %s: %.0f%% valid (%d/%d) -- attempting recovery...\n",
+                        devices[p]->config().port_name, rate * 100.0,
+                        final_valid[p], final_reads);
+            bool recovered = false;
+            for (int a = 0; a < 5 && g_running; ++a) {
+                if (ads1299::ADS1299Controller::recover_port(*devices[p], a, 10)) {
+                    std::printf("    %s: recovered [OK]\n", devices[p]->config().port_name);
+                    recovered = true;
+                    break;
+                }
+            }
+            if (recovered) {
+                active_ports++;
+            } else {
+                port_dead[p] = true;
+                std::printf("    %s: DEAD after recovery attempt\n",
+                            devices[p]->config().port_name);
+                devices[p]->start_low();
+                devices[p]->send_command(ads1299::Cmd::STOP);
+                devices[p]->send_command(ads1299::Cmd::SDATAC);
+            }
+        }
+    }
+
+    if (active_ports == 0) {
+        std::fprintf(stderr, "\n[FAIL] No active ports after initialization\n");
+        return 1;
+    }
+
+    // Count dead ports for summary
+    int dead_count = 0;
+    for (int p = 0; p < args.num_ports; ++p) {
+        if (port_dead[p]) dead_count++;
+    }
+
+    if (dead_count > 0) {
+        std::printf("\n[WARN] %d port(s) dead, running with %d/%d ports\n",
+                    dead_count, active_ports, args.num_ports);
+        std::printf("  Dead:");
+        for (int p = 0; p < args.num_ports; ++p) {
+            if (port_dead[p]) std::printf(" %s", devices[p]->config().port_name);
+        }
+        std::printf("\n");
+    }
+
+    std::printf("\n============================================================\n"
+                "[OK] SYSTEM INITIALIZATION COMPLETE (%d/%d ports active)\n"
+                "============================================================\n",
+                active_ports, args.num_ports);
 
     // --- Create DRDY poller ---
     ads1299::DRDYPoller drdy_poller(i2c, ads1299::TCA9534_DRDY_ADDR);
@@ -288,15 +517,17 @@ int main(int argc, char* argv[]) {
 
     // --- Create bus workers ---
     // Group ports by physical SPI bus, assign CPU cores:
-    // SPI0→core 0, SPI3→core 1, SPI4→core 2, SPI5→core 0 (1 port, finishes fast)
+    // SPI0→core 0, SPI3→core 1, SPI4→core 2, SPI5→core 2
+    // SPI5 moved off core 0 to avoid contending with SPI0 (Port1's 9-deep chain
+    // has tightest timing margin; sharing core 0 with SPI5 added ~252us delay)
     auto bus_groups = ads1299::group_ports_by_bus(args.ports, args.num_ports);
 
     auto get_core = [](int bus_num) -> int {
         switch (bus_num) {
-            case 0: return 0;
+            case 0: return 0;  // SPI0 (Port1+2): sole owner, fastest path to Port1
             case 3: return 1;
             case 4: return 2;
-            case 5: return 0;  // SPI5 has only 1 port, safe to share core 0
+            case 5: return 2;  // SPI5 (Port7): shares core 2 with SPI4
             default: return 0;
         }
     };
@@ -367,6 +598,7 @@ int main(int argc, char* argv[]) {
                 "============================================================\n\n");
 
     ads1299::AcquisitionEngine engine(devices, workers, drdy_poller, *ring);
+    engine.set_csv_enabled(args.full_csv);
     engine.set_streaming_server(&streaming_server);
 
     // If duration specified, set up a timer thread
@@ -379,7 +611,49 @@ int main(int argc, char* argv[]) {
         timer_thread.detach();
     }
 
+    // Stats display thread: pinned to core 1 (housekeeping core)
+    // Polls engine.stats_ready_ flag every 1s, prints stats when signaled.
+    // Replaces the old print_stats() call that was inside the RT hot loop.
+    std::thread stats_thread([&]() {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(1, &cpuset);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+
+        while (g_running) {
+            sleep_sec(1.0);
+
+            if (engine.stats_ready_.exchange(false, std::memory_order_acquire)) {
+                auto s = engine.get_stats();
+                double rate = s.runtime_sec > 0 ? s.total_samples / s.runtime_sec : 0;
+
+                std::printf("\n  [%6.0fs] samples=%lu rate=%.1fHz cycle=%.2f/%.2f/%.2fms "
+                            "dt=%.2f/%.2fms timeouts=%lu corrupt=%lu drops=%lu\n",
+                            s.runtime_sec,
+                            static_cast<unsigned long>(s.total_samples),
+                            rate, s.min_cycle_ms, s.mean_cycle_ms, s.max_cycle_ms,
+                            s.min_dt_ms, s.max_dt_ms,
+                            static_cast<unsigned long>(s.drdy_timeouts),
+                            static_cast<unsigned long>(s.corruption_count),
+                            static_cast<unsigned long>(s.drop_count));
+
+                auto ss = streaming_server.get_stats();
+                std::printf("           stream: sent=%lu batches=%lu drops=%lu queued=%zu %s\n",
+                            static_cast<unsigned long>(ss.samples_sent),
+                            static_cast<unsigned long>(ss.batches_sent),
+                            static_cast<unsigned long>(ss.drops),
+                            ss.ring_queued,
+                            ss.connected ? "[connected]" : "[no client]");
+            }
+        }
+    });
+
     engine.run(g_running);
+
+    // Join stats thread after engine.run() returns
+    if (stats_thread.joinable()) {
+        stats_thread.join();
+    }
 
     // --- Shutdown ---
     std::printf("\n\nShutdown...\n");
@@ -418,20 +692,24 @@ int main(int argc, char* argv[]) {
                 "Cycle time: %.2f / %.2f / %.2f ms (min/mean/max)\n"
                 "Sample dt:  %.2f / %.2f ms (min/max)\n"
                 "DRDY timeouts:  %lu\n"
-                "Corruptions:    %lu\n"
-                "Ring drops:     %lu\n"
-                "CSV written:    %lu\n"
-                "Stream sent:    %lu (batches: %lu, drops: %lu, reconnects: %lu)\n"
-                "============================================================\n\n",
+                "Corruptions:    %lu\n",
                 static_cast<unsigned long>(stats.total_samples),
                 stats.runtime_sec,
                 rate,
                 stats.min_cycle_ms, stats.mean_cycle_ms, stats.max_cycle_ms,
                 stats.min_dt_ms, stats.max_dt_ms,
                 static_cast<unsigned long>(stats.drdy_timeouts),
-                static_cast<unsigned long>(stats.corruption_count),
-                static_cast<unsigned long>(stats.drop_count),
-                csv_writer ? static_cast<unsigned long>(csv_writer->total_written()) : 0UL,
+                static_cast<unsigned long>(stats.corruption_count));
+
+    if (csv_writer) {
+        std::printf("Ring drops:     %lu\n"
+                    "CSV written:    %lu\n",
+                    static_cast<unsigned long>(stats.drop_count),
+                    static_cast<unsigned long>(csv_writer->total_written()));
+    }
+
+    std::printf("Stream sent:    %lu (batches: %lu, drops: %lu, reconnects: %lu)\n"
+                "============================================================\n\n",
                 static_cast<unsigned long>(ss.samples_sent),
                 static_cast<unsigned long>(ss.batches_sent),
                 static_cast<unsigned long>(ss.drops),

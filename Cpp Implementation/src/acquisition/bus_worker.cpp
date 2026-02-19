@@ -7,6 +7,7 @@
 #include <sched.h>
 #include <pthread.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 namespace ads1299 {
@@ -44,6 +45,16 @@ BusWorker::~BusWorker() {
 }
 
 void BusWorker::run() {
+    // Lock all pages (process-wide, idempotent with engine's mlockall)
+    mlockall(MCL_CURRENT | MCL_FUTURE);
+
+    // Pre-fault 64KB of stack — prevents minor page faults during SPI ioctl
+    volatile char stack_prefault[64 * 1024];
+    for (size_t i = 0; i < sizeof(stack_prefault); i += 4096) {
+        stack_prefault[i] = 0;
+    }
+    (void)stack_prefault;
+
     // Set RT priority: SCHED_FIFO 49 (one below engine's 50)
     struct sched_param param{};
     param.sched_priority = 49;

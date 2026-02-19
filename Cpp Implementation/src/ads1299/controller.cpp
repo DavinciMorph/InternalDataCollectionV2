@@ -26,7 +26,7 @@ static void sleep_ms(double ms) {
     sleep_sec(ms / 1000.0);
 }
 
-// --- ADS1299Controller ---
+// --- ADS1299Controller: Register helpers ---
 
 bool ADS1299Controller::write_and_verify(ADS1299Device& dev, Reg reg, uint8_t value,
                                           const char* name, int max_attempts) {
@@ -60,6 +60,10 @@ bool ADS1299Controller::verify_register(ADS1299Device& dev, Reg reg, uint8_t exp
     }
     return false;
 }
+
+// --- ADS1299Controller: Device initialization ---
+// This configures registers only. Always succeeds if hardware is present.
+// Does NOT enter RDATAC or assert START.
 
 bool ADS1299Controller::initialize_device(ADS1299Device& dev, const DeviceConfig& config) {
     std::printf("\nConfiguring %s...\n", dev.config().port_name);
@@ -205,51 +209,188 @@ bool ADS1299Controller::initialize_device(ADS1299Device& dev, const DeviceConfig
     return false;
 }
 
-bool ADS1299Controller::restart_single_port(ADS1299Device& dev, int attempt, bool verbose) {
-    int delay_scale = attempt + 1;
+// --- ADS1299Controller: Port data verification ---
+// Reads num_samples from a single port, returns count of valid samples
+// (where ALL devices in the daisy chain have status byte high nibble == 0xC0).
 
-    // Stop the port
-    dev.start_low();
-    sleep_ms(20.0 * delay_scale);
-
-    dev.send_command(Cmd::STOP);
-    sleep_ms(10);
-    dev.send_command(Cmd::SDATAC);
-    sleep_ms(20.0 * delay_scale);
-
-    // Re-enter RDATAC (send twice for reliability)
-    dev.send_command(Cmd::RDATAC);
-    sleep_ms(10);
-    dev.send_command(Cmd::RDATAC);
-    sleep_ms(20.0 * delay_scale);
-
-    // Assert START
-    dev.start_high();
-    sleep_ms(50.0 * delay_scale);
-
-    // Verify DRDY and data
-    if (dev.wait_for_drdy(0.1)) {
+int ADS1299Controller::verify_port_data(ADS1299Device& dev, int num_samples) {
+    int valid = 0;
+    for (int i = 0; i < num_samples; ++i) {
+        if (!dev.wait_for_drdy(0.02)) {
+            continue;  // DRDY timeout — count as invalid
+        }
         PortData pd;
         dev.read_data(pd);
-        uint8_t status0 = pd.status_bytes[0][0];
-        if ((status0 & 0xF0) == 0xC0) {
-            return true;
-        } else if (verbose) {
-            if (status0 == 0x00) {
-                std::printf("    %s: DRDY active but returning zeros (attempt %d)\n",
-                            dev.config().port_name, attempt + 1);
-            } else {
-                std::printf("    %s: DRDY active, status=0x%02X (attempt %d)\n",
-                            dev.config().port_name, status0, attempt + 1);
+
+        bool sample_ok = true;
+        for (int d = 0; d < dev.config().num_devices; ++d) {
+            if ((pd.status_bytes[d][0] & 0xF0) != 0xC0) {
+                sample_ok = false;
+                break;
             }
         }
-    } else if (verbose) {
-        std::printf("    %s: DRDY still not active (attempt %d)\n",
-                    dev.config().port_name, attempt + 1);
+        if (sample_ok) {
+            valid++;
+        }
+    }
+    return valid;
+}
+
+// --- ADS1299Controller: Start and verify (no recovery) ---
+// Sends RDATAC to all ports, asserts START atomically, then verifies
+// each port independently. Returns per-port health in healthy_out.
+// Does NOT attempt any recovery — that is the caller's job.
+
+void ADS1299Controller::start_and_verify(
+    std::vector<ADS1299Device*>& devices,
+    I2CDevice& i2c,
+    PortHealth* healthy_out,
+    const volatile sig_atomic_t& running) {
+
+    int num_ports = static_cast<int>(devices.size());
+
+    // Initialize all health entries to unhealthy
+    for (int i = 0; i < num_ports; ++i) {
+        healthy_out[i] = {false, false, 0, 0};
     }
 
-    return false;
+    // 1. Stop everything cleanly
+    std::printf("  Stopping any ongoing conversions...\n");
+    force_all_start_pins_low(devices);
+    broadcast_command(devices, static_cast<uint8_t>(Cmd::STOP), 10);
+
+    if (!running) return;
+
+    // 2. Ensure SDATAC on all devices
+    std::printf("  Ensuring all devices in SDATAC mode...\n");
+    broadcast_command(devices, static_cast<uint8_t>(Cmd::SDATAC), 50);
+
+    if (!running) return;
+
+    // 3. Flush all SPI shift registers
+    for (auto* dev : devices) {
+        dev->flush_spi();
+    }
+    sleep_ms(10);
+
+    // 4. Send RDATAC to all devices (fast sequential, twice for reliability)
+    std::printf("  Sending RDATAC to all devices...\n");
+    for (auto* dev : devices) {
+        dev->send_command(Cmd::RDATAC);
+    }
+    sleep_ms(50);
+    for (auto* dev : devices) {
+        dev->send_command(Cmd::RDATAC);
+    }
+    sleep_ms(100);
+
+    if (!running) return;
+
+    // 5. Assert START on all ports atomically via TCA9534MultiPin
+    {
+        TCA9534MultiPin start_controller(i2c);
+        for (auto* dev : devices) {
+            start_controller.add_pin(dev->config().start_i2c_addr, dev->config().start_pin);
+        }
+        start_controller.set_all_high();
+    }
+    std::printf("  [All START pins asserted simultaneously]\n");
+
+    // 6. Wait for conversions to start (100ms is sufficient — first DRDY at 4ms)
+    sleep_ms(100);
+
+    if (!running) return;
+
+    // 7. Verify each port independently: DRDY active + valid status bytes
+    std::printf("\n  Verifying each port...\n");
+
+    constexpr int VERIFY_SAMPLES = 10;
+
+    for (int p = 0; p < num_ports; ++p) {
+        if (!running) return;
+
+        auto* dev = devices[p];
+        auto& health = healthy_out[p];
+
+        // Check DRDY
+        health.drdy_active = dev->wait_for_drdy(0.1);
+        if (!health.drdy_active) {
+            std::printf("    %s: DRDY not active [FAIL]\n", dev->config().port_name);
+            continue;
+        }
+
+        // Read VERIFY_SAMPLES and check status bytes on all devices in chain
+        health.valid_samples = verify_port_data(*dev, VERIFY_SAMPLES);
+        health.total_samples = VERIFY_SAMPLES;
+
+        // Require >= 80% valid (8/10) to mark healthy
+        health.healthy = (health.valid_samples >= (VERIFY_SAMPLES * 8 / 10));
+
+        if (health.healthy) {
+            std::printf("    %s: %d/%d valid [OK]\n",
+                        dev->config().port_name, health.valid_samples, VERIFY_SAMPLES);
+        } else {
+            std::printf("    %s: %d/%d valid [FAIL]\n",
+                        dev->config().port_name, health.valid_samples, VERIFY_SAMPLES);
+        }
+    }
 }
+
+// --- ADS1299Controller: Recover a single port ---
+// Cycles one port through STOP->SDATAC->flush->RDATAC->START and verifies.
+// This targets the RDATAC timing race specifically. Fast (~200ms per attempt).
+// Does NOT touch register configuration — that is already correct.
+
+bool ADS1299Controller::recover_port(ADS1299Device& dev, int attempt, int verify_samples) {
+    // Escalating delay: attempt 0 = 1x, attempt 1 = 2x, etc.
+    int scale = attempt + 1;
+
+    // 1. De-assert START
+    dev.start_low();
+    sleep_ms(20.0 * scale);
+
+    // 2. STOP command
+    dev.send_command(Cmd::STOP);
+    sleep_ms(10);
+
+    // 3. Exit RDATAC
+    dev.send_command(Cmd::SDATAC);
+    sleep_ms(20.0 * scale);
+
+    // 4. Flush SPI shift register (clears stale data)
+    dev.flush_spi();
+    sleep_ms(5);
+
+    // 5. Re-enter RDATAC (send twice for reliability across daisy chain)
+    dev.send_command(Cmd::RDATAC);
+    sleep_ms(10);
+    dev.send_command(Cmd::RDATAC);
+    sleep_ms(20.0 * scale);
+
+    // 6. Assert START
+    dev.start_high();
+    sleep_ms(50.0 * scale);
+
+    // 7. Verify: read verify_samples and check status bytes on all devices
+    int valid = verify_port_data(dev, verify_samples);
+
+    // Require >= 80% valid
+    return valid >= (verify_samples * 8 / 10);
+}
+
+// --- ADS1299Controller: Legacy restart_single_port ---
+// Kept for backward compatibility. Calls recover_port internally.
+
+bool ADS1299Controller::restart_single_port(ADS1299Device& dev, int attempt, bool verbose) {
+    bool ok = recover_port(dev, attempt, 5);
+    if (!ok && verbose) {
+        std::printf("    %s: restart failed (attempt %d)\n",
+                    dev.config().port_name, attempt + 1);
+    }
+    return ok;
+}
+
+// --- ADS1299Controller: Utility functions ---
 
 void ADS1299Controller::broadcast_command(std::vector<ADS1299Device*>& devices,
                                            uint8_t cmd, double delay_ms_val) {
@@ -262,7 +403,6 @@ void ADS1299Controller::broadcast_command(std::vector<ADS1299Device*>& devices,
 }
 
 void ADS1299Controller::force_all_start_pins_low(std::vector<ADS1299Device*>& devices) {
-    std::printf("Forcing all START pins LOW...\n");
     for (auto* dev : devices) {
         dev->start_low();
     }
@@ -276,484 +416,6 @@ TCA9534MultiPin ADS1299Controller::create_start_controller(
         ctrl.add_pin(dev->config().start_i2c_addr, dev->config().start_pin);
     }
     return ctrl;
-}
-
-bool ADS1299Controller::start_all_conversions_synchronized(
-    std::vector<ADS1299Device*>& devices,
-    I2CDevice& i2c,
-    const DeviceConfig* config) {
-
-    std::printf("\n  Starting conversions with synchronized START...\n");
-
-    std::printf("    Stopping any ongoing conversions...\n");
-    force_all_start_pins_low(devices);
-    broadcast_command(devices, static_cast<uint8_t>(Cmd::STOP), 10);
-
-    std::printf("    Ensuring all devices in SDATAC mode...\n");
-    broadcast_command(devices, static_cast<uint8_t>(Cmd::SDATAC), 50);
-
-    std::printf("    Sending RDATAC to all devices (fast sequential)...\n");
-    // Send RDATAC as quickly as possible to minimize desync
-    for (auto* dev : devices) {
-        dev->send_command(Cmd::RDATAC);
-    }
-    sleep_ms(50);
-    // Second RDATAC pass to ensure all devices received it
-    for (auto* dev : devices) {
-        dev->send_command(Cmd::RDATAC);
-    }
-    sleep_ms(200);  // 200ms settling after RDATAC
-
-    // Verify device communication after RDATAC
-    std::printf("    Verifying device communication after RDATAC...\n");
-    std::vector<int> rdatac_fail_indices;
-    for (size_t i = 0; i < devices.size(); ++i) {
-        auto* dev = devices[i];
-        dev->flush_spi();
-        sleep_ms(2);
-        // Read 3 bytes to check for 0xFF (RDATAC failed)
-        uint8_t check_tx[3] = {0, 0, 0};
-        uint8_t check_rx[3] = {0, 0, 0};
-        dev->spi().transfer(check_tx, check_rx, 3);
-        if (check_rx[0] == 0xFF && check_rx[1] == 0xFF && check_rx[2] == 0xFF) {
-            rdatac_fail_indices.push_back(static_cast<int>(i));
-            std::printf("      [WARN] %s: SPI returns 0xFF - RDATAC may have failed\n",
-                        dev->config().port_name);
-        }
-    }
-
-    if (!rdatac_fail_indices.empty()) {
-        std::printf("    Retrying RDATAC for failed ports...\n");
-        for (int idx : rdatac_fail_indices) {
-            auto* dev = devices[idx];
-            dev->send_command(Cmd::SDATAC);
-            sleep_ms(10);
-            dev->send_command(Cmd::RDATAC);
-            sleep_ms(20);
-            dev->send_command(Cmd::RDATAC);
-            sleep_ms(20);
-        }
-    }
-    sleep_ms(50);
-
-    // Assert START on all ports atomically via TCA9534MultiPin
-    {
-        TCA9534MultiPin start_controller(i2c);
-        for (auto* dev : devices) {
-            start_controller.add_pin(dev->config().start_i2c_addr, dev->config().start_pin);
-        }
-        start_controller.set_all_high();
-    }
-    std::printf("    [All START pins asserted simultaneously]\n");
-    sleep_ms(100);  // 100ms synchronization after START
-
-    for (auto* dev : devices) {
-        std::printf("    %s: START asserted [OK]\n", dev->config().port_name);
-    }
-
-    // Verify DRDY is actually toggling on each port
-    std::printf("\n  Verifying DRDY signals are active...\n");
-    std::vector<int> drdy_failure_indices;
-    for (size_t i = 0; i < devices.size(); ++i) {
-        if (devices[i]->wait_for_drdy(0.1)) {
-            std::printf("    %s: DRDY active [OK]\n", devices[i]->config().port_name);
-        } else {
-            std::printf("    %s: DRDY NOT active [FAIL]\n", devices[i]->config().port_name);
-            drdy_failure_indices.push_back(static_cast<int>(i));
-        }
-    }
-
-    if (!drdy_failure_indices.empty()) {
-        std::printf("  [WARN] DRDY failed on %zu port(s) - attempting restart...\n",
-                    drdy_failure_indices.size());
-        for (int idx : drdy_failure_indices) {
-            bool restart_success = false;
-            for (int attempt = 0; attempt < 3; ++attempt) {
-                if (restart_single_port(*devices[idx], attempt)) {
-                    std::printf("    %s: DRDY now active [OK] (attempt %d)\n",
-                                devices[idx]->config().port_name, attempt + 1);
-                    restart_success = true;
-                    break;
-                }
-            }
-            if (!restart_success) {
-                std::printf("    %s: Restart failed after 3 attempts [FAIL]\n",
-                            devices[idx]->config().port_name);
-            }
-        }
-    }
-
-    std::printf("\n  Waiting 1000ms for stabilization...\n");
-    sleep_ms(1000);
-
-    // Check individual port DRDY signals and data
-    std::printf("\n  Checking individual port DRDY signals...\n");
-    std::vector<ADS1299Device*> ports_needing_restart;
-    for (auto* dev : devices) {
-        bool drdy_active = dev->wait_for_drdy(0.05);
-        if (drdy_active) {
-            int zero_count = 0;
-            int valid_count = 0;
-            for (int s = 0; s < 5; ++s) {
-                PortData pd;
-                dev->read_data(pd);
-                uint8_t status0 = pd.status_bytes[0][0];
-                if (status0 == 0x00) {
-                    zero_count++;
-                } else if ((status0 & 0xF0) == 0xC0) {
-                    valid_count++;
-                }
-                sleep_ms(4);
-            }
-
-            if (valid_count >= 3) {
-                std::printf("    %s: DRDY [OK], valid status [OK] (%d/5 valid)\n",
-                            dev->config().port_name, valid_count);
-            } else if (zero_count >= 3) {
-                std::printf("    %s: DRDY [OK], but returning zeros (%d/5) [FAIL]\n",
-                            dev->config().port_name, zero_count);
-                ports_needing_restart.push_back(dev);
-            } else {
-                std::printf("    %s: DRDY [OK], mixed status (valid=%d, zero=%d)\n",
-                            dev->config().port_name, valid_count, zero_count);
-                if (zero_count > valid_count) {
-                    ports_needing_restart.push_back(dev);
-                }
-            }
-        } else {
-            std::printf("    %s: DRDY not active [FAIL]\n", dev->config().port_name);
-            ports_needing_restart.push_back(dev);
-        }
-    }
-
-    if (!ports_needing_restart.empty()) {
-        std::printf("\n  Restarting %zu ports...\n", ports_needing_restart.size());
-        for (auto* dev : ports_needing_restart) {
-            bool restart_success = false;
-            for (int attempt = 0; attempt < 3; ++attempt) {
-                if (restart_single_port(*dev, attempt, false)) {
-                    std::printf("    %s: restart ok (attempt %d) [OK]\n",
-                                dev->config().port_name, attempt + 1);
-                    restart_success = true;
-                    break;
-                }
-            }
-            if (!restart_success) {
-                std::printf("    %s: restart failed\n", dev->config().port_name);
-            }
-        }
-        sleep_ms(200);
-    }
-
-    // 500-sample warmup
-    std::printf("\n  Discarding 500 warmup samples...\n");
-    // Use port with longest daisy chain as reference
-    ADS1299Device* reference_port = devices[0];
-    for (auto* dev : devices) {
-        if (dev->config().num_devices > reference_port->config().num_devices) {
-            reference_port = dev;
-        }
-    }
-
-    int warmup_count = 0;
-    int warmup_drdy_timeouts = 0;
-
-    // Per-port corruption counters
-    int warmup_corruptions[MAX_PORTS] = {};
-    int consecutive_zeros[MAX_PORTS] = {};
-    bool port_restart_attempted[MAX_PORTS] = {};
-
-    for (int i = 0; i < 500; ++i) {
-        if (reference_port->wait_for_drdy(0.02)) {
-            for (size_t p = 0; p < devices.size(); ++p) {
-                auto* dev = devices[p];
-                PortData pd;
-                dev->read_data(pd);
-                uint8_t status0 = pd.status_bytes[0][0];
-
-                if ((status0 & 0xF0) != 0xC0) {
-                    warmup_corruptions[p]++;
-                    if (status0 == 0x00) {
-                        consecutive_zeros[p]++;
-                    } else {
-                        consecutive_zeros[p] = 0;
-                    }
-                } else {
-                    consecutive_zeros[p] = 0;
-                }
-
-                // Auto-restart port after 20 consecutive zeros
-                if (consecutive_zeros[p] >= 20 && !port_restart_attempted[p]) {
-                    port_restart_attempted[p] = true;
-                    std::printf("    [WARN] %s: 20+ zeros at sample %d, restarting...\n",
-                                dev->config().port_name, i);
-                    bool restart_success = false;
-                    for (int ra = 0; ra < 3; ++ra) {
-                        if (restart_single_port(*dev, ra, false)) {
-                            std::printf("      %s: restart ok (attempt %d) [OK]\n",
-                                        dev->config().port_name, ra + 1);
-                            consecutive_zeros[p] = 0;
-                            restart_success = true;
-                            break;
-                        }
-                    }
-                    if (!restart_success) {
-                        std::printf("      %s: restart failed\n", dev->config().port_name);
-                    }
-                }
-            }
-            warmup_count++;
-        } else {
-            warmup_drdy_timeouts++;
-            if (warmup_drdy_timeouts <= 5) {
-                std::printf("    Warmup sample %d: DRDY timeout on reference port\n", i);
-            }
-        }
-    }
-
-    if (warmup_drdy_timeouts > 0) {
-        std::printf("  [WARN] %d DRDY timeouts during warmup (%.1f%%)\n",
-                    warmup_drdy_timeouts, warmup_drdy_timeouts / 500.0 * 100.0);
-    }
-
-    int total_warmup_corruptions = 0;
-    for (size_t p = 0; p < devices.size(); ++p) {
-        total_warmup_corruptions += warmup_corruptions[p];
-    }
-
-    if (total_warmup_corruptions > 0) {
-        std::printf("  [WARN] Warmup STATUS corruption: %d total\n", total_warmup_corruptions);
-        for (size_t p = 0; p < devices.size(); ++p) {
-            if (warmup_corruptions[p] > 0) {
-                double pct = warmup_count > 0 ? warmup_corruptions[p] * 100.0 / warmup_count : 0;
-                std::printf("    %s: %d (%.1f%%)\n",
-                            devices[p]->config().port_name, warmup_corruptions[p], pct);
-            }
-        }
-    }
-    std::printf("  Discarded %d warmup samples\n", warmup_count);
-
-    // Check for ports with elevated warmup corruption (>10%) and try aggressive re-init
-    constexpr double WARMUP_REINIT_THRESHOLD = 0.10;
-    struct ReinitEntry {
-        ADS1299Device* dev;
-        size_t port_idx;
-        double corruption_rate;
-    };
-    std::vector<ReinitEntry> ports_needing_reinit;
-
-    for (size_t p = 0; p < devices.size(); ++p) {
-        if (warmup_count > 0) {
-            double rate = static_cast<double>(warmup_corruptions[p]) / warmup_count;
-            if (rate > WARMUP_REINIT_THRESHOLD) {
-                ports_needing_reinit.push_back({devices[p], p, rate});
-            }
-        }
-    }
-
-    if (!ports_needing_reinit.empty()) {
-        std::printf("\n  [WARN] %zu port(s) with >10%% warmup corruption - "
-                    "attempting aggressive re-init...\n", ports_needing_reinit.size());
-
-        for (auto& entry : ports_needing_reinit) {
-            auto* dev = entry.dev;
-            std::printf("    %s: %.1f%% corruption - full re-init...\n",
-                        dev->config().port_name, entry.corruption_rate * 100.0);
-
-            // 1. Stop the port completely
-            dev->start_low();
-            sleep_ms(50);
-            dev->send_command(Cmd::STOP);
-            sleep_ms(20);
-
-            // 2. Full re-initialization
-            bool reinit_ok = false;
-            if (config != nullptr) {
-                reinit_ok = initialize_device(*dev, *config);
-            } else {
-                // Fallback: just cycle commands
-                dev->flush_spi();
-                dev->send_command(Cmd::SDATAC);
-                sleep_ms(100);
-            }
-
-            if (reinit_ok) {
-                // 3. Enter RDATAC and start conversion
-                dev->send_command(Cmd::RDATAC);
-                sleep_ms(10);
-                dev->send_command(Cmd::RDATAC);
-                sleep_ms(50);
-                dev->start_high();
-                sleep_ms(200);
-
-                // 4. Mini-warmup: verify data is clean
-                if (dev->wait_for_drdy(0.1)) {
-                    int mini_corruptions = 0;
-                    for (int s = 0; s < 50; ++s) {
-                        if (dev->wait_for_drdy(0.02)) {
-                            PortData pd;
-                            dev->read_data(pd);
-                            if ((pd.status_bytes[0][0] & 0xF0) != 0xC0) {
-                                mini_corruptions++;
-                            }
-                        }
-                    }
-                    double mini_rate = mini_corruptions / 50.0;
-                    if (mini_rate < 0.05) {
-                        std::printf("      %s: re-init successful (%.1f%% corruption) [OK]\n",
-                                    dev->config().port_name, mini_rate * 100.0);
-                        warmup_corruptions[entry.port_idx] = static_cast<int>(mini_rate * warmup_count);
-                    } else {
-                        std::printf("      %s: re-init helped but still %.1f%% corruption\n",
-                                    dev->config().port_name, mini_rate * 100.0);
-                        warmup_corruptions[entry.port_idx] = static_cast<int>(mini_rate * warmup_count);
-                    }
-                } else {
-                    std::printf("      %s: DRDY not active after re-init [FAIL]\n",
-                                dev->config().port_name);
-                }
-            } else {
-                std::printf("      %s: re-initialization failed [FAIL]\n",
-                            dev->config().port_name);
-            }
-        }
-    }
-
-    // 20-sample data flow verification
-    std::printf("\n  Verifying data flow (20 reads)...\n");
-    reference_port = devices[0];
-    for (auto* dev : devices) {
-        if (dev->config().num_devices > reference_port->config().num_devices) {
-            reference_port = dev;
-        }
-    }
-
-    int valid_counts[MAX_PORTS] = {};
-    int total_reads = 0;
-    int drdy_timeouts = 0;
-
-    for (int read_num = 0; read_num < 20; ++read_num) {
-        if (reference_port->wait_for_drdy(0.02)) {
-            total_reads++;
-            for (size_t p = 0; p < devices.size(); ++p) {
-                PortData pd;
-                devices[p]->read_data(pd);
-                if ((pd.status_bytes[0][0] & 0xF0) == 0xC0) {
-                    valid_counts[p]++;
-                }
-            }
-        } else {
-            drdy_timeouts++;
-            if (drdy_timeouts <= 3) {
-                std::printf("    Read %d: DRDY timeout on reference port\n", read_num);
-            }
-        }
-    }
-
-    if (drdy_timeouts > 0) {
-        std::printf("  [WARN] %d DRDY timeouts during verification\n", drdy_timeouts);
-    }
-
-    bool all_ok = true;
-    for (size_t p = 0; p < devices.size(); ++p) {
-        int count = valid_counts[p];
-        if (count >= 10) {
-            std::printf("    [OK] %s: Data flowing (%d/%d valid)\n",
-                        devices[p]->config().port_name, count, total_reads);
-        } else {
-            std::printf("    [WARN] %s: Low valid (%d/%d)\n",
-                        devices[p]->config().port_name, count, total_reads);
-            if (count == 0) {
-                all_ok = false;
-            }
-        }
-    }
-
-    if (all_ok) {
-        std::printf("\n  [OK] All %zu devices verified!\n", devices.size());
-    } else {
-        std::printf("\n  [WARN] Some ports had issues but may self-correct during streaming\n");
-    }
-
-    // Final re-synchronization
-    std::printf("\n  Final re-synchronization...\n");
-
-    // Stop all conversions atomically
-    {
-        TCA9534MultiPin start_controller(i2c);
-        for (auto* dev : devices) {
-            start_controller.add_pin(dev->config().start_i2c_addr, dev->config().start_pin);
-        }
-        start_controller.set_all_low();
-    }
-    sleep_ms(100);
-
-    broadcast_command(devices, static_cast<uint8_t>(Cmd::STOP), 10);
-    sleep_ms(200);
-
-    // Flush all shift registers
-    for (auto* dev : devices) {
-        dev->flush_spi();
-    }
-
-    // Re-enter RDATAC
-    broadcast_command(devices, static_cast<uint8_t>(Cmd::SDATAC), 20);
-    broadcast_command(devices, static_cast<uint8_t>(Cmd::RDATAC), 10);
-    broadcast_command(devices, static_cast<uint8_t>(Cmd::RDATAC), 20);
-
-    // Restart all simultaneously
-    {
-        TCA9534MultiPin start_controller(i2c);
-        for (auto* dev : devices) {
-            start_controller.add_pin(dev->config().start_i2c_addr, dev->config().start_pin);
-        }
-        start_controller.set_all_high();
-    }
-    sleep_ms(500);
-
-    // Discard first 100 post-resync samples and measure DRDY timing
-    reference_port = devices[0];
-    for (auto* dev : devices) {
-        if (dev->config().num_devices > reference_port->config().num_devices) {
-            reference_port = dev;
-        }
-    }
-
-    std::printf("\n  Post-resync settling (100 samples)...\n");
-
-    double drdy_times[10] = {};
-    int drdy_time_count = 0;
-
-    for (int sample_idx = 0; sample_idx < 100; ++sample_idx) {
-        struct timespec ts_start, ts_end;
-        clock_gettime(CLOCK_MONOTONIC, &ts_start);
-
-        if (reference_port->wait_for_drdy(0.02)) {
-            clock_gettime(CLOCK_MONOTONIC, &ts_end);
-            double drdy_elapsed = (ts_end.tv_sec - ts_start.tv_sec) * 1000.0 +
-                                  (ts_end.tv_nsec - ts_start.tv_nsec) / 1e6;
-
-            for (auto* dev : devices) {
-                PortData pd;
-                dev->read_data(pd);
-            }
-
-            if (sample_idx < 10 && drdy_time_count < 10) {
-                drdy_times[drdy_time_count++] = drdy_elapsed;
-            }
-        }
-    }
-
-    if (drdy_time_count > 0) {
-        double avg = 0;
-        for (int i = 0; i < drdy_time_count; ++i) avg += drdy_times[i];
-        avg /= drdy_time_count;
-        std::printf("  DRDY timing (first 10): avg %.2fms\n", avg);
-    }
-
-    std::printf("  [OK] Re-synchronization complete\n");
-
-    return all_ok;
 }
 
 } // namespace ads1299

@@ -65,32 +65,6 @@ AcquisitionEngine::AcquisitionEngine(
     }
 }
 
-void AcquisitionEngine::print_stats() {
-    double elapsed = clock_now() - start_time_;
-    double rate = total_samples_ > 0 ? total_samples_ / elapsed : 0;
-    double mean = total_samples_ > 0 ? cycle_sum_ms_ / total_samples_ : 0;
-
-    std::printf("\n  [%6.0fs] samples=%lu rate=%.1fHz cycle=%.2f/%.2f/%.2fms "
-                "dt=%.2f/%.2fms timeouts=%lu corrupt=%lu drops=%lu\n",
-                elapsed,
-                static_cast<unsigned long>(total_samples_),
-                rate, min_cycle_ms_, mean, max_cycle_ms_,
-                min_dt_ms_, max_dt_ms_,
-                static_cast<unsigned long>(drdy_timeouts_),
-                static_cast<unsigned long>(corruption_count_),
-                static_cast<unsigned long>(drop_count_));
-
-    if (streaming_) {
-        auto ss = streaming_->get_stats();
-        std::printf("           stream: sent=%lu batches=%lu drops=%lu queued=%zu %s\n",
-                    static_cast<unsigned long>(ss.samples_sent),
-                    static_cast<unsigned long>(ss.batches_sent),
-                    static_cast<unsigned long>(ss.drops),
-                    ss.ring_queued,
-                    ss.connected ? "[connected]" : "[no client]");
-    }
-}
-
 void AcquisitionEngine::run(volatile sig_atomic_t& running) {
     // --- RT Hardening ---
 
@@ -169,10 +143,13 @@ void AcquisitionEngine::run(volatile sig_atomic_t& running) {
 
             ADS1299Device::parse_raw(raw, num_dev, port_data);
 
-            // Status byte validation (first device)
-            if ((port_data.status_bytes[0][0] & 0xF0) != 0xC0) {
-                corruption_count_++;
-                sample.valid = false;
+            // Status byte validation (ALL devices in chain)
+            for (int d = 0; d < num_dev; ++d) {
+                if ((port_data.status_bytes[d][0] & 0xF0) != 0xC0) {
+                    corruption_count_++;
+                    sample.valid = false;
+                    break;  // One bad device invalidates entire sample
+                }
             }
 
             // Copy channel values into sample
@@ -183,9 +160,11 @@ void AcquisitionEngine::run(volatile sig_atomic_t& running) {
             }
         }
 
-        // 5. Non-blocking push to SPSC ring buffer (CSV)
-        if (!ring_.try_push(sample)) {
-            drop_count_++;
+        // 5. Non-blocking push to SPSC ring buffer (CSV) — skipped when no CSV consumer
+        if (csv_enabled_) {
+            if (!ring_.try_push(sample)) {
+                drop_count_++;
+            }
         }
 
         // 5b. Non-blocking push to streaming ring buffer (TCP)
@@ -209,15 +188,15 @@ void AcquisitionEngine::run(volatile sig_atomic_t& running) {
 
         total_samples_++;
 
-        // 7. Print stats every 10 seconds
+        // 7. Signal stats thread every 10 seconds (zero syscalls on RT core)
         if (cycle_end - last_stats_time_ >= STATS_INTERVAL_SEC) {
-            print_stats();
+            stats_ready_.store(true, std::memory_order_release);
             last_stats_time_ = cycle_end;
         }
     }
 
-    // Final stats on shutdown
-    print_stats();
+    // Signal final stats
+    stats_ready_.store(true, std::memory_order_release);
 
     if (pm_fd >= 0) {
         ::close(pm_fd);

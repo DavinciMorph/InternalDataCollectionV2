@@ -24,14 +24,17 @@ Usage:
 """
 
 import sys
+import os
 import socket
 import json
 import argparse
 import time
 import struct
 import traceback
+import threading
 import lz4.frame
 from collections import deque
+from datetime import datetime
 from queue import Queue, Empty
 from dataclasses import dataclass
 from typing import List, Optional
@@ -161,6 +164,176 @@ def parse_spi_ports(ports_string: str) -> List[SPIPortConfig]:
             raise ValueError(f"Invalid port format '{entry}'. Expected 'Name,NumDevices'")
         ports.append(SPIPortConfig(name=parts[0], num_devices=int(parts[1])))
     return ports
+
+
+# ============================================================================
+# CLIENT-SIDE CSV WRITER (async, non-blocking)
+# ============================================================================
+
+class CSVWriterThread:
+    """Async CSV writer that runs in a dedicated thread.
+
+    Consumes raw (pre-filter) sample dicts from a queue and writes them
+    to a timestamped CSV file in the same format as the server's CSVWriter:
+        timestamp,sample_number,Port1_dev1_ch1,...,PortN_devM_ch8
+
+    Non-blocking: the network thread does a non-blocking put(); if the
+    CSV queue is full, the sample is silently dropped (GUI/network never stalls).
+    """
+
+    def __init__(self, port_configs, csv_dir="."):
+        """Initialize the writer. Does NOT start writing until start() is called.
+
+        Args:
+            port_configs: list of dicts with 'name' and 'num_devices' keys
+                          (from server metadata port_config)
+            csv_dir: directory to write the CSV file into
+        """
+        self._port_configs = port_configs
+        self._csv_dir = csv_dir
+        self._queue = Queue(maxsize=10000)
+        self._running = False
+        self._thread = None
+        self._total_written = 0
+        self._filename = None
+
+        # Build channel names matching server format: PortN_devM_chK
+        self._channel_names = []
+        for pc in port_configs:
+            port_name = pc['name']
+            num_devices = pc['num_devices']
+            for d in range(num_devices):
+                for c in range(8):
+                    self._channel_names.append(
+                        f"{port_name}_dev{d+1}_ch{c+1}"
+                    )
+        self._num_channels = len(self._channel_names)
+
+    @property
+    def filename(self):
+        return self._filename
+
+    @property
+    def total_written(self):
+        return self._total_written
+
+    def start(self):
+        """Open the CSV file and start the writer thread."""
+        if self._running:
+            return
+
+        ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        self._filename = os.path.join(self._csv_dir, f"eeg_data_{ts}.csv")
+
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._run, name="csv-writer", daemon=True
+        )
+        self._thread.start()
+        print(f"[csv] Writing {self._num_channels} channels to {self._filename}")
+
+    def push(self, sample):
+        """Non-blocking enqueue. Drops sample if queue is full."""
+        if not self._running:
+            return
+        try:
+            self._queue.put_nowait(sample)
+        except Exception:
+            pass  # Queue full — drop silently, never block network thread
+
+    def stop(self):
+        """Signal the writer to drain remaining samples, flush, and close."""
+        if not self._running:
+            return
+        self._running = False
+        # Put a sentinel to unblock the writer if it's waiting
+        try:
+            self._queue.put_nowait(None)
+        except Exception:
+            pass
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+        print(f"[csv] Writer stopped: {self._total_written} samples written")
+
+    def _run(self):
+        """Writer thread main loop."""
+        f = None
+        try:
+            f = open(self._filename, 'w', buffering=65536)  # 64KB buffer
+
+            # Write header
+            header = "timestamp,sample_number," + ",".join(self._channel_names) + "\n"
+            f.write(header)
+
+            while True:
+                # Block up to 100ms waiting for samples (matches server flush timeout)
+                try:
+                    sample = self._queue.get(timeout=0.1)
+                except Empty:
+                    if not self._running:
+                        break
+                    continue
+
+                if sample is None:
+                    # Sentinel — drain remaining and exit
+                    break
+
+                self._write_sample(f, sample)
+                self._total_written += 1
+
+                # Drain burst: write up to 500 more without blocking
+                for _ in range(500):
+                    try:
+                        sample = self._queue.get_nowait()
+                    except Empty:
+                        break
+                    if sample is None:
+                        break
+                    self._write_sample(f, sample)
+                    self._total_written += 1
+
+            # Drain anything remaining after stop signal
+            while True:
+                try:
+                    sample = self._queue.get_nowait()
+                except Empty:
+                    break
+                if sample is None:
+                    continue
+                self._write_sample(f, sample)
+                self._total_written += 1
+
+        except Exception as e:
+            print(f"[csv] Writer error: {e}")
+            traceback.print_exc()
+        finally:
+            if f is not None:
+                try:
+                    f.flush()
+                    f.close()
+                except Exception:
+                    pass
+
+    def _write_sample(self, f, sample):
+        """Format and write a single sample row.
+
+        Format matches server: %.6f,sample_number,ch1,ch2,...,chN
+        Channels are raw int32 values (no float conversion).
+        """
+        channels = sample['channels']
+        num_ch = min(len(channels), self._num_channels)
+
+        # Build row: timestamp (6 decimal places), sample_number, then channels
+        parts = [f"{sample['timestamp']:.6f}", str(sample['sample_number'])]
+        for i in range(num_ch):
+            parts.append(str(channels[i]))
+        # Pad with zeros if fewer channels than expected
+        for i in range(num_ch, self._num_channels):
+            parts.append('0')
+
+        f.write(','.join(parts))
+        f.write('\n')
 
 
 # ============================================================================
@@ -409,13 +582,16 @@ class PortColumn(QtWidgets.QWidget):
 class SignalVisualizer(QtWidgets.QMainWindow):
     """Real-time EEG signal visualizer with side-by-side port columns."""
 
-    def __init__(self, host, port, spi_ports, window_seconds=5.0):
+    def __init__(self, host, port, spi_ports, window_seconds=5.0,
+                 csv_enabled=True, csv_dir='.'):
         super().__init__()
 
         self.host = host
         self.port = port
         self.spi_ports = spi_ports
         self.window_seconds = window_seconds
+        self.csv_enabled = csv_enabled
+        self.csv_dir = csv_dir
         self.sample_rate = 250
         self.max_samples = int(self.sample_rate * window_seconds)
         self.notch_on = True
@@ -428,6 +604,9 @@ class SignalVisualizer(QtWidgets.QMainWindow):
 
         # Thread-safe queue for cross-thread sample transfer
         self.sample_queue = Queue(maxsize=5000)
+
+        # CSV writer (created when server config arrives)
+        self.csv_writer = None
 
         self._init_data_state()
 
@@ -499,6 +678,9 @@ class SignalVisualizer(QtWidgets.QMainWindow):
         self._init_data_state()
         self._rebuild_port_columns()
 
+        # Start CSV writer with the new port config
+        self._start_csv_writer(port_configs)
+
     def _build_port_columns(self):
         """Create PortColumn widgets for current spi_ports config."""
         ch_offset = 0
@@ -525,6 +707,22 @@ class SignalVisualizer(QtWidgets.QMainWindow):
             f"Configured: {len(self.spi_ports)} ports, "
             f"{total_dev} devices, {total_ch} channels"
         )
+
+    def _start_csv_writer(self, port_configs):
+        """Start (or restart) the CSV writer with the given port configuration."""
+        # Stop any existing writer (e.g. on reconnect with new config)
+        if self.csv_writer is not None:
+            self.csv_writer.stop()
+            self.csv_writer = None
+
+        if not self.csv_enabled:
+            return
+
+        self.csv_writer = CSVWriterThread(port_configs, csv_dir=self.csv_dir)
+        self.csv_writer.start()
+
+        # Tell network thread about the new writer
+        self.network_thread.csv_writer = self.csv_writer
 
     def setup_ui(self):
         self.setWindowTitle('ADS1299 Signal Visualizer')
@@ -688,9 +886,12 @@ class SignalVisualizer(QtWidgets.QMainWindow):
             port_summary = " | ".join(
                 f"{p.name}({p.num_channels}ch)" for p in self.spi_ports
             )
+            csv_info = ""
+            if self.csv_writer is not None:
+                csv_info = f" | CSV: {self.csv_writer.total_written}"
             self.status.setText(
                 f'{port_summary} | Rate: {rate:.1f} Hz | '
-                f'Samples: {self.sample_count}'
+                f'Samples: {self.sample_count}{csv_info}'
             )
 
     def update_plots(self):
@@ -809,6 +1010,9 @@ class SignalVisualizer(QtWidgets.QMainWindow):
     def closeEvent(self, event):
         self.network_thread.stop()
         self.network_thread.wait()
+        if self.csv_writer is not None:
+            self.csv_writer.stop()
+            self.csv_writer = None
         event.accept()
 
 
@@ -829,6 +1033,7 @@ class NetworkThread(QtCore.QThread):
         self.port = port
         self.running = True
         self.buffer = b''
+        self.csv_writer = None  # Set by SignalVisualizer when config arrives
 
     def run(self):
         ip = self.host
@@ -877,6 +1082,12 @@ class NetworkThread(QtCore.QThread):
                                 'sample_number': unpacked[1],
                                 'channels': list(unpacked[2:]),
                             }
+
+                            # Feed raw sample to CSV writer (non-blocking)
+                            csv_w = self.csv_writer
+                            if csv_w is not None:
+                                csv_w.push(sample)
+
                             try:
                                 self.visualizer.sample_queue.put_nowait(sample)
                             except Exception:
@@ -963,6 +1174,10 @@ SPI Port Format: "Name,NumDevices Name2,NumDevices2 ..."
                         help='Time window in seconds (default: 5.0)')
     parser.add_argument('--spi-ports', type=str, default=None,
                         help='Override port config (default: auto-detect from server)')
+    parser.add_argument('--no-csv', action='store_true', default=False,
+                        help='Disable client-side CSV recording')
+    parser.add_argument('--csv-dir', type=str, default='.',
+                        help='Directory for CSV output (default: current directory)')
 
     args = parser.parse_args()
 
@@ -983,6 +1198,8 @@ SPI Port Format: "Name,NumDevices Name2,NumDevices2 ..."
         args.port,
         spi_ports,
         window_seconds=args.window,
+        csv_enabled=not args.no_csv,
+        csv_dir=args.csv_dir,
     )
     viz.show()
 
@@ -1001,6 +1218,8 @@ SPI Port Format: "Name,NumDevices Name2,NumDevices2 ..."
             ch_offset += p.num_channels
     else:
         print("Port config: auto-detect from server")
+    csv_status = f"CSV: OFF" if args.no_csv else f"CSV: ON (dir: {os.path.abspath(args.csv_dir)})"
+    print(f"{csv_status}")
     print(f"{'='*50}\n")
 
     sys.exit(app.exec_())

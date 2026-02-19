@@ -28,6 +28,11 @@ public:
     // Set optional TCP streaming server (called before run())
     void set_streaming_server(StreamingServer* s) { streaming_ = s; }
 
+    // Enable/disable CSV ring buffer push in hot loop.
+    // When disabled, the SPSC ring push is skipped entirely (saves ~610ns/cycle
+    // and avoids inflating drop_count when no consumer is draining the ring).
+    void set_csv_enabled(bool enabled) { csv_enabled_ = enabled; }
+
     // Run the hot loop until running flag is cleared (by signal handler)
     void run(volatile sig_atomic_t& running);
 
@@ -47,6 +52,10 @@ public:
 
     Stats get_stats() const;
 
+    // Atomic flag: set by engine every STATS_INTERVAL_SEC.
+    // External stats thread checks this, reads get_stats(), and clears it.
+    alignas(64) std::atomic<bool> stats_ready_{false};
+
 private:
     // Build mapping from port index to (worker_index, port_within_worker)
     struct PortWorkerMap {
@@ -59,6 +68,7 @@ private:
     DRDYPoller& drdy_poller_;
     SPSCRing<Sample>& ring_;
     StreamingServer* streaming_ = nullptr;
+    bool csv_enabled_ = false;
 
     PortWorkerMap port_map_[MAX_PORTS];
     int num_ports_;
@@ -81,7 +91,6 @@ private:
     static constexpr double STATS_INTERVAL_SEC = 10.0;
     double last_stats_time_;
 
-    void print_stats();
     static double clock_now();
 };
 
