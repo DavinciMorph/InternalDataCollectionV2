@@ -336,18 +336,14 @@ void ADS1299Controller::start_and_verify(
     }
 }
 
-// --- ADS1299Controller: Recover a single port ---
-// Cycles one port through STOP->SDATAC->flush->RDATAC->START and verifies.
-// This targets the RDATAC timing race specifically. Fast (~200ms per attempt).
-// Does NOT touch register configuration — that is already correct.
+// --- ADS1299Controller: Tier 1 recovery ---
+// Cycles STOP->SDATAC->flush->RDATAC->START. Fixed ~200ms, no escalating delay.
+// Targets the RDATAC output pipeline timing race.
 
-bool ADS1299Controller::recover_port(ADS1299Device& dev, int attempt, int verify_samples) {
-    // Escalating delay: attempt 0 = 1x, attempt 1 = 2x, etc.
-    int scale = attempt + 1;
-
+bool ADS1299Controller::recover_port_tier1(ADS1299Device& dev, int verify_samples) {
     // 1. De-assert START
     dev.start_low();
-    sleep_ms(20.0 * scale);
+    sleep_ms(20);
 
     // 2. STOP command
     dev.send_command(Cmd::STOP);
@@ -355,7 +351,7 @@ bool ADS1299Controller::recover_port(ADS1299Device& dev, int attempt, int verify
 
     // 3. Exit RDATAC
     dev.send_command(Cmd::SDATAC);
-    sleep_ms(20.0 * scale);
+    sleep_ms(20);
 
     // 4. Flush SPI shift register (clears stale data)
     dev.flush_spi();
@@ -365,24 +361,122 @@ bool ADS1299Controller::recover_port(ADS1299Device& dev, int attempt, int verify
     dev.send_command(Cmd::RDATAC);
     sleep_ms(10);
     dev.send_command(Cmd::RDATAC);
-    sleep_ms(20.0 * scale);
+    sleep_ms(20);
 
     // 6. Assert START
     dev.start_high();
-    sleep_ms(50.0 * scale);
+    sleep_ms(100);
 
     // 7. Verify: read verify_samples and check status bytes on all devices
     int valid = verify_port_data(dev, verify_samples);
-
-    // Require >= 80% valid
     return valid >= (verify_samples * 8 / 10);
 }
 
-// --- ADS1299Controller: Legacy restart_single_port ---
-// Kept for backward compatibility. Calls recover_port internally.
+// --- ADS1299Controller: write_registers ---
+// Writes all configuration registers. Skips SDATAC verify loop and ID check.
+// Used by Tier 2 recovery where hardware presence is already confirmed.
+
+bool ADS1299Controller::write_registers(ADS1299Device& dev, const DeviceConfig& config) {
+    // Ensure SDATAC mode on all devices in the chain
+    for (int i = 0; i < 5; ++i) {
+        dev.send_command(Cmd::SDATAC);
+        sleep_ms(10);
+    }
+    sleep_ms(50);
+
+    // CONFIG3 first — enables internal reference. Must settle before ADC is usable.
+    if (!write_and_verify(dev, Reg::CONFIG3, config.config3, "CONFIG3")) return false;
+    sleep_ms(200);  // Reference buffer settling
+
+    if (!write_and_verify(dev, Reg::CONFIG1, config.config1, "CONFIG1")) return false;
+    if (!write_and_verify(dev, Reg::CONFIG2, config.config2, "CONFIG2")) return false;
+
+    auto ch_settings = config.get_channel_settings();
+    for (int i = 0; i < 8; ++i) {
+        char name[16];
+        std::snprintf(name, sizeof(name), "CH%dSET", i + 1);
+        Reg reg = static_cast<Reg>(static_cast<uint8_t>(Reg::CH1SET) + i);
+        if (!write_and_verify(dev, reg, ch_settings[i], name)) return false;
+    }
+
+    if (!write_and_verify(dev, Reg::MISC1, config.misc1, "MISC1")) return false;
+    if (!write_and_verify(dev, Reg::CONFIG4, config.config4, "CONFIG4")) return false;
+
+    return true;
+}
+
+// --- ADS1299Controller: Tier 2 recovery ---
+// Software RESET + register reconfig + RDATAC->START. ~500ms per attempt.
+// Targets digital core latch failures that Tier 1 cycling cannot clear.
+// ADS1299 datasheet §9.4.1: after RESET, device needs 18 tCLK before ready.
+
+bool ADS1299Controller::recover_port_tier2(ADS1299Device& dev, const DeviceConfig& config,
+                                            int verify_samples) {
+    // 1. Clean slate: de-assert START, stop conversions, exit data mode
+    dev.start_low();
+    sleep_ms(20);
+    dev.send_command(Cmd::STOP);
+    sleep_ms(10);
+    dev.send_command(Cmd::SDATAC);
+    sleep_ms(20);
+
+    // 2. Software RESET — reinitializes digital core including output pipeline mux.
+    //    Send twice for reliability across the daisy chain.
+    dev.send_command(Cmd::RESET);
+    sleep_ms(10);
+    dev.send_command(Cmd::RESET);
+
+    // 3. Wait for oscillator startup and digital core initialization.
+    //    150ms provides large margin for 4-deep daisy chain.
+    sleep_ms(150);
+
+    // 4. SDATAC to enable register access (RESET leaves device in SDATAC)
+    for (int i = 0; i < 5; ++i) {
+        dev.send_command(Cmd::SDATAC);
+        sleep_ms(10);
+    }
+    sleep_ms(30);
+
+    // 5. Rewrite all registers (fast path — no SDATAC verify loop, no ID check)
+    if (!write_registers(dev, config)) {
+        std::printf("    %s: Tier 2 register rewrite failed\n",
+                    dev.config().port_name);
+        return false;
+    }
+
+    // 6. Flush + re-enter RDATAC
+    dev.flush_spi();
+    sleep_ms(5);
+    dev.send_command(Cmd::RDATAC);
+    sleep_ms(10);
+    dev.send_command(Cmd::RDATAC);
+    sleep_ms(30);
+
+    // 7. Assert START
+    dev.start_high();
+    sleep_ms(100);
+
+    // 8. Verify
+    int valid = verify_port_data(dev, verify_samples);
+    bool ok = valid >= (verify_samples * 8 / 10);
+
+    if (!ok) {
+        std::printf("    %s: Tier 2 verify failed (%d/%d valid)\n",
+                    dev.config().port_name, valid, verify_samples);
+    }
+    return ok;
+}
+
+// --- ADS1299Controller: Legacy wrappers ---
+// Call recover_port_tier1() internally.
+
+bool ADS1299Controller::recover_port(ADS1299Device& dev, int /*attempt*/,
+                                      int verify_samples) {
+    return recover_port_tier1(dev, verify_samples);
+}
 
 bool ADS1299Controller::restart_single_port(ADS1299Device& dev, int attempt, bool verbose) {
-    bool ok = recover_port(dev, attempt, 5);
+    bool ok = recover_port_tier1(dev, 5);
     if (!ok && verbose) {
         std::printf("    %s: restart failed (attempt %d)\n",
                     dev.config().port_name, attempt + 1);

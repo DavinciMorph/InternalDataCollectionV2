@@ -46,18 +46,39 @@ INACTIVE_STYLE = 'background-color: #2a2a2a; color: #aaaaaa; padding: 4px 8px;'
 
 
 def parse_hierarchy(channel_names):
-    """Detect Port{N}_dev{M}_ch{K} naming and return sorted unique lists."""
+    """Detect Port{N}_dev{M}_ch{K} naming and return hierarchy mappings.
+
+    Returns a dict with:
+        'ports':        sorted list of all port names
+        'all_devs':     sorted list of all unique device names (union across ports)
+        'all_chs':      sorted list of all unique channel names (union across all)
+        'port_devs':    {port: [sorted devices present under this port]}
+        'port_dev_chs': {(port, dev): [sorted channels present under this combo]}
+    Returns None if channel names don't match hierarchical pattern.
+    """
     pat = re.compile(r'^(Port\d+)_(dev\d+)_(ch\d+)$')
-    ports, devs, chs = set(), set(), set()
+    ports_set, devs_set, chs_set = set(), set(), set()
+    port_devs_map = {}       # port -> set of devs
+    port_dev_chs_map = {}    # (port, dev) -> set of chs
     for name in channel_names:
         m = pat.match(name)
         if not m:
             return None  # not hierarchical
-        ports.add(m.group(1))
-        devs.add(m.group(2))
-        chs.add(m.group(3))
+        p, d, c = m.group(1), m.group(2), m.group(3)
+        ports_set.add(p)
+        devs_set.add(d)
+        chs_set.add(c)
+        port_devs_map.setdefault(p, set()).add(d)
+        port_dev_chs_map.setdefault((p, d), set()).add(c)
+
     sort_key = lambda s: int(re.search(r'\d+', s).group())
-    return sorted(ports, key=sort_key), sorted(devs, key=sort_key), sorted(chs, key=sort_key)
+    return {
+        'ports':        sorted(ports_set, key=sort_key),
+        'all_devs':     sorted(devs_set, key=sort_key),
+        'all_chs':      sorted(chs_set, key=sort_key),
+        'port_devs':    {p: sorted(ds, key=sort_key) for p, ds in port_devs_map.items()},
+        'port_dev_chs': {k: sorted(cs, key=sort_key) for k, cs in port_dev_chs_map.items()},
+    }
 
 
 class CSVViewer(QtWidgets.QMainWindow):
@@ -89,9 +110,9 @@ class CSVViewer(QtWidgets.QMainWindow):
 
         # Initial selection
         if self.hierarchy:
-            self.sel_port = self.hierarchy[0][0]
-            self.sel_dev = self.hierarchy[1][0]
-            self.sel_ch = self.hierarchy[2][0]
+            self.sel_port = self.hierarchy['ports'][0]
+            self.sel_dev = self.hierarchy['port_devs'][self.sel_port][0]
+            self.sel_ch = self.hierarchy['port_dev_chs'][(self.sel_port, self.sel_dev)][0]
         self.selected_channel = 0
 
         # Pre-compute 60 Hz notch-filtered signals for all channels
@@ -162,13 +183,13 @@ class CSVViewer(QtWidgets.QMainWindow):
     # --- Hierarchical selector (Port / Device / Channel rows) ---
 
     def _build_hierarchical_selector(self, layout):
-        ports, devs, chs = self.hierarchy
+        h = self.hierarchy
 
-        # Port row
+        # Port row — all ports are always visible
         port_bar = QtWidgets.QHBoxLayout()
         port_bar.addWidget(QtWidgets.QLabel('Port:'))
         self.port_btns = {}
-        for p in ports:
+        for p in h['ports']:
             btn = QtWidgets.QPushButton(p)
             btn.setCheckable(True)
             btn.clicked.connect(lambda checked, name=p: self._pick_port(name))
@@ -177,11 +198,11 @@ class CSVViewer(QtWidgets.QMainWindow):
         port_bar.addStretch()
         layout.addLayout(port_bar)
 
-        # Device row
+        # Device row — create buttons for all unique devices, visibility controlled per port
         dev_bar = QtWidgets.QHBoxLayout()
         dev_bar.addWidget(QtWidgets.QLabel('Device:'))
         self.dev_btns = {}
-        for d in devs:
+        for d in h['all_devs']:
             btn = QtWidgets.QPushButton(d)
             btn.setCheckable(True)
             btn.clicked.connect(lambda checked, name=d: self._pick_dev(name))
@@ -190,11 +211,11 @@ class CSVViewer(QtWidgets.QMainWindow):
         dev_bar.addStretch()
         layout.addLayout(dev_bar)
 
-        # Channel row
+        # Channel row — create buttons for all unique channels, visibility controlled per port+dev
         ch_bar = QtWidgets.QHBoxLayout()
         ch_bar.addWidget(QtWidgets.QLabel('Channel:'))
         self.ch_btns = {}
-        for c in chs:
+        for c in h['all_chs']:
             btn = QtWidgets.QPushButton(c)
             btn.setCheckable(True)
             btn.clicked.connect(lambda checked, name=c: self._pick_ch(name))
@@ -203,6 +224,7 @@ class CSVViewer(QtWidgets.QMainWindow):
         ch_bar.addStretch()
         layout.addLayout(ch_bar)
 
+        self._update_visible_buttons()
         self._style_hierarchy_buttons()
 
     def _pick_port(self, name):

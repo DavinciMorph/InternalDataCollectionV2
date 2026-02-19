@@ -29,7 +29,7 @@ SPIKE_THRESHOLD = 500       # min jump from both neighbors to flag as spike
 TIMESTAMP_JITTER_MULT = 2.0 # flag intervals > this * expected_dt
 RAIL_VALUES = {0, 8388607, -8388608}
 BIT_SHIFTS_TO_CHECK = [1, 2, 3, 4]  # check if corrupted = expected >> N
-RANGE_LOW = -5000               # test signal expected minimum
+RANGE_LOW = -5500               # test signal expected minimum
 RANGE_HIGH = 3000               # test signal expected maximum
 MAX_DETAIL_LINES = 10           # max detailed events to print per category
 

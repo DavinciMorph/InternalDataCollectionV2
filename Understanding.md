@@ -847,3 +847,97 @@ The stats thread on core 1 writes to stdout (SSH PTY). When the SSH connection h
 **This confirms the root cause:** SD card EMMC2 DMA writeback was saturating the AXI bus, stalling all 4 SPI DMA controllers simultaneously. Removing server-side CSV writing eliminated 100% of EMMC2 DMA traffic during acquisition, resulting in a completely clean 20-minute run with no timing anomalies.
 
 The mean cycle drift issue (0.64→0.74ms in Run 1) is also resolved — max dt of 4.221ms shows no stall events at all, confirming the drift was caused by increasing SD card write contention, not thermal throttling.
+
+---
+
+## Phase B2 Init Redesign: Tiered Recovery + 7/7 Hard Gate (2026-02-19)
+
+### Problem
+
+Fresh power-on (2026-02-19) produced two consecutive failed runs. Port2 was declared DEAD after 15 recovery attempts on both runs. The engine still reported "328 channels" and **100% of 1562 samples were corrupt** because dead Port2's garbage data poisoned every sample. A power cycle fixed everything.
+
+Three independent agents (error-detective, cpp-embedded, performance-engineer) analyzed the code and unanimously identified the same root causes:
+
+1. **Recovery never sends RESET**: `recover_port()` only cycles STOP→SDATAC→flush→RDATAC→START. If a device has a power-on latch failure (corrupted digital core state), this will fail 100% of the time forever. Software RESET (0x06) is needed to clear it.
+2. **Escalating delays waste time**: Recovery uses `sleep_ms(X * scale)` where `scale = attempt+1`. Attempt 14 wastes 14× more time per cycle. The RDATAC timing race is memoryless — longer delays don't help.
+3. **Dead ports not excluded from acquisition**: `port_dead[]` was set but never consulted when building downstream components (bus workers, engine, streaming server). Dead port's garbage data causes 100% corruption.
+
+### What Was Changed
+
+**`controller.hpp` + `controller.cpp` — Tiered recovery methods:**
+
+- **`recover_port_tier1()`**: Current `recover_port()` logic with ALL escalating `* scale` multipliers removed. Fixed ~200ms per attempt: start_low(20ms) → STOP(10ms) → SDATAC(20ms) → flush(5ms) → RDATAC×2(10ms+20ms) → start_high(100ms) → verify 10 samples.
+- **`write_registers()`**: Extracted register-write-only path from `initialize_device()`. Writes CONFIG3 (+200ms settle), CONFIG1, CONFIG2, CH1-8SET, MISC1, CONFIG4 via `write_and_verify()`. Sends SDATAC×5 first. Skips ID check (hardware presence already confirmed in Phase 1).
+- **`recover_port_tier2()`**: Full software RESET path: start_low + STOP + SDATAC → RESET×2 (daisy chain reliability) → 150ms settle → SDATAC×5 → write_registers() → flush → RDATAC×2 → start_high → verify.
+- Legacy wrappers (`recover_port()`, `restart_single_port()`) now delegate to `recover_port_tier1()`.
+
+**`main.cpp` — `run_tiered_recovery()` function:**
+
+Replaced the flat 15-attempt `recover_port()` loop with a 3-tier strategy:
+
+| Tier | Method | Per-attempt | Attempts | Worst case/port | Targets |
+|------|--------|-------------|----------|-----------------|---------|
+| 1 | RDATAC cycle | ~200ms | 8 | ~1.6s | RDATAC timing race (~90% of failures) |
+| 2 | Software RESET + reconfig | ~500ms | 5 | ~2.5s | Power-on latch failures |
+| 3 | Full re-init ALL ports | ~30s | 2 rounds | ~60s | Cross-port state interference |
+
+Between Tier 3 attempts, runs a quick Tier 1 pass on still-failing ports.
+
+**`main.cpp` — 7/7 hard gate:**
+
+After all tiers, if any port is still dead → hard exit with "POWER CYCLE REQUIRED" message (exit code 2, distinct from code 1 = general error). No graceful degradation by default.
+
+**`main.cpp` — `--min-ports` escape hatch:**
+
+Default requires all ports. `--min-ports N` allows running with fewer for testing. When enabled and some ports are dead, builds filtered `active_devices`/`active_configs` vectors excluding dead ports. All downstream components (DRDY poller, bus workers, CSV writer, streaming server, engine) use the filtered vectors.
+
+**Other `main.cpp` changes:**
+- Warmup increased from 100 to 250 samples (~1 second at 250 Hz) to absorb post-recovery settling artifacts.
+- DRDY-missing for a non-dead port after successful init is now a hard error (return 1), not a warning.
+
+### Time Budget (worst case)
+
+| Tier | Per-port | 7 ports |
+|------|----------|---------|
+| Tier 1 (8 × 200ms) | ~1.6s | ~11.2s |
+| Tier 2 (5 × 500ms) | ~2.5s | ~17.5s |
+| Tier 3 (2 full re-inits) | n/a | ~60s |
+| **Total worst case** | | **~89s** |
+
+Typical case (most ports fail RDATAC race, recover in Tier 1 within 1-3 attempts): **~3-5 seconds total**.
+
+---
+
+## 2026-02-19 Session: Battery Failure + Port3 Dev5 Ch4 Investigation
+
+### Context
+
+Battery ran out during acquisition, system died. After replacing battery and reconnecting:
+
+**Run 1 (bad):** Stream rate was ~50 Hz (should be 250 Hz), data was queuing nonstop. Aborted immediately. Likely cause: the battery failure left devices in a bad state, and the first init attempt didn't fully recover all ports. The 50 Hz stream rate suggests the engine was running but TCP backpressure or worker stalls reduced throughput.
+
+**Run 2 (mostly good):** All 7 ports initialized, 250 Hz locked, clean data — except Port3 dev5 ch4. That single channel (and all subsequent ch4 entries for devices after dev5 on Port3) showed anomalous values.
+
+### Investigation: Port3 Dev5 Ch4
+
+**CSV analyzed:** `client/eeg_data_2026-02-19_120122.csv` — 14,171 samples, 330 columns.
+
+**Finding:** Only Port3_dev5_ch4 was anomalous. Mean ~293,800 (0x0478A9) with stdev ~1,116, while all other 327 channels had mean ~-4,600 (normal test signal range). The anomalous values were consistent across all 14,171 samples — not intermittent, but a stuck wrong-value condition.
+
+**Root cause: CH4SET register bit-flip (0x05 → 0x04)**
+
+The value 293,800 corresponds to ~157mV at the ADS1299 ADC scale. This is exactly the ADS1299 internal temperature sensor reading at warm operating temperature. A single bit-0 flip in the CH4SET register changes:
+- `0x05` = normal input (MUXn[2:0] = 101 = test signal)
+- `0x04` = temperature sensor (MUXn[2:0] = 100)
+
+This single-bit corruption most likely occurred during the power failure and wasn't caught by the init process.
+
+### Register Verification Blind Spot (Known Issue)
+
+This failure was NOT detected by init because of two known limitations:
+
+1. **`write_and_verify()` only reads back from device 1** in each daisy chain. The SPI RREG command clocks out register values for all devices, but the code only reads enough bytes for device 1. Devices 2+ receive the same write commands (shared MOSI) but their register state is never verified.
+
+2. **`verify_port_data()` only checks status bytes**, not channel data values. The 0xC0 top nibble of the status byte was valid — the ADS1299 was converting and streaming correctly, just reading from the wrong input mux. Channel-level data validation (checking for expected test signal range) would have caught this.
+
+**Decision:** User declined implementing channel-level data validation since the system won't remain in test mode much longer. The register verification blind spot is documented here for reference. A production system should implement per-device register readback verification using the full daisy-chain RREG protocol (clock out N×bytes for N devices).
