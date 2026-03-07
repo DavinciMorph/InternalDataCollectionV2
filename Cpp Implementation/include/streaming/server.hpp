@@ -8,9 +8,6 @@
 #include <cstdint>
 #include <thread>
 
-// Forward declare LZ4F types to avoid including lz4frame.h in header
-typedef struct LZ4F_cctx_s LZ4F_cctx;
-
 namespace ads1299 {
 
 class StreamingServer {
@@ -70,14 +67,9 @@ private:
     int client_fd_;  // owned by stream_thread only
 
     // Pre-allocated buffers
-    uint8_t* batch_buf_;   // BATCH_SIZE * wire_sample_size
-    uint8_t* lz4_buf_;     // LZ4 compressed output
-    uint8_t* frame_buf_;   // 8 (header) + lz4 output
-    size_t   lz4_cap_;
+    uint8_t* batch_buf_;   // BATCH_SIZE * wire_sample_size (accumulates packed samples)
+    uint8_t* frame_buf_;   // 8 (header) + raw payload
     size_t   frame_cap_;
-
-    // LZ4 streaming context (allocated once)
-    LZ4F_cctx* lz4_ctx_;
 
     // Metadata JSON (built once at construction)
     char metadata_buf_[1024];

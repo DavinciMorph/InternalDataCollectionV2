@@ -5,15 +5,17 @@
 #   "PyQt5",
 #   "pyqtgraph",
 #   "scipy",
-#   "lz4",
 # ]
 # ///
 """
-ADS1299 Signal Visualizer (Server-Timed, Binary LZ4)
+ADS1299 Signal Visualizer (Server-Timed, Binary TCP)
 ====================================================
 
 Streams binary LZ4-compressed EEG data from Controller.py and displays
-channels organized by SPI port in side-by-side columns.
+8 channels for a selected port + device combination.
+
+Port/device selection via top-row buttons. Only one device's 8 plots
+are visible at a time, filling the full window.
 
 Port configuration is auto-detected from the server metadata.
 Use --spi-ports to manually override if needed.
@@ -32,7 +34,6 @@ import time
 import struct
 import traceback
 import threading
-import lz4.frame
 from collections import deque
 from datetime import datetime
 from queue import Queue, Empty
@@ -46,6 +47,13 @@ import pyqtgraph as pg
 # OpenGL disabled — it causes crashes on many GPU drivers
 pg.setConfigOptions(useOpenGL=False, antialias=False)
 
+# ============================================================================
+# ADC CONSTANTS
+# ============================================================================
+FS = 250                # Sample rate (Hz)
+VREF = 4.5              # ADS1299 reference voltage (V)
+GAIN = 24               # PGA gain
+LSB_UV = (VREF / (2**23) / GAIN) * 1e6  # uV per LSB = 0.02235 uV
 
 # ============================================================================
 # DARK NEON THEME
@@ -101,42 +109,6 @@ QPushButton {{
 QPushButton:hover {{
     background-color: #3a3a3a;
     border-color: {ACCENT_COLOR};
-}}
-QScrollArea {{
-    border: none;
-    background-color: {DARK_BG};
-}}
-QScrollBar:vertical {{
-    background-color: #1a1a1a;
-    width: 12px;
-    border-radius: 6px;
-}}
-QScrollBar::handle:vertical {{
-    background-color: #444;
-    border-radius: 6px;
-    min-height: 30px;
-}}
-QScrollBar::handle:vertical:hover {{
-    background-color: {ACCENT_COLOR};
-}}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
-    height: 0px;
-}}
-QScrollBar:horizontal {{
-    background-color: #1a1a1a;
-    height: 12px;
-    border-radius: 6px;
-}}
-QScrollBar::handle:horizontal {{
-    background-color: #444;
-    border-radius: 6px;
-    min-width: 30px;
-}}
-QScrollBar::handle:horizontal:hover {{
-    background-color: {ACCENT_COLOR};
-}}
-QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
-    width: 0px;
 }}
 """
 
@@ -337,250 +309,15 @@ class CSVWriterThread:
 
 
 # ============================================================================
-# PORT COLUMN — button on top, plots drop down below
-# ============================================================================
-
-class PortColumn(QtWidgets.QWidget):
-    """A single port column: port header, device buttons, and channel plots."""
-
-    def __init__(self, port_config, start_ch_idx, color, parent_viz):
-        super().__init__()
-        self.port_config = port_config
-        self.start_ch_idx = start_ch_idx
-        self.color = color
-        self.parent_viz = parent_viz
-        self.active_device: Optional[int] = None  # Currently shown device (0-indexed), None = collapsed
-
-        # Per-device state: plots/curves created lazily
-        self.num_devices = port_config.num_devices
-        self.device_plots: List[List[pg.PlotWidget]] = [[] for _ in range(self.num_devices)]
-        self.device_curves: List[list] = [[] for _ in range(self.num_devices)]
-        self.device_created: List[bool] = [False] * self.num_devices
-        self.device_containers: List[QtWidgets.QWidget] = []
-        self.device_buttons: List[QtWidgets.QPushButton] = []
-        self._dev_stuck_state: List[bool] = [False] * self.num_devices
-
-        self.setup_ui()
-
-    def setup_ui(self):
-        layout = QtWidgets.QVBoxLayout()
-        layout.setContentsMargins(2, 0, 2, 0)
-        layout.setSpacing(2)
-
-        # Port header (non-toggle, just a label)
-        header = QtWidgets.QLabel(self.port_config.name)
-        header.setAlignment(QtCore.Qt.AlignCenter)
-        header.setStyleSheet(f"""
-            QLabel {{
-                background-color: #1a1a1a;
-                color: {self.color};
-                border: 2px solid {self.color};
-                border-radius: 6px;
-                padding: 8px 4px;
-                font-size: 11pt;
-                font-weight: bold;
-            }}
-        """)
-        layout.addWidget(header)
-
-        # Device buttons row
-        dev_row = QtWidgets.QHBoxLayout()
-        dev_row.setSpacing(3)
-        for d in range(self.num_devices):
-            btn = QtWidgets.QPushButton(f"Dev {d+1}")
-            btn.setStyleSheet(self._dev_btn_style(active=False))
-            btn.clicked.connect(lambda checked, idx=d: self.select_device(idx))
-            dev_row.addWidget(btn)
-            self.device_buttons.append(btn)
-        layout.addLayout(dev_row)
-
-        # One container per device (only one visible at a time)
-        for d in range(self.num_devices):
-            container = QtWidgets.QWidget()
-            container_layout = QtWidgets.QVBoxLayout()
-            container_layout.setContentsMargins(2, 4, 2, 4)
-            container_layout.setSpacing(2)
-            container.setLayout(container_layout)
-            container.setVisible(False)
-            self.device_containers.append(container)
-            layout.addWidget(container)
-
-        self.setLayout(layout)
-
-    def _create_device_plots(self, dev_idx):
-        """Create 8 PlotWidgets for a device on first expand."""
-        if self.device_created[dev_idx]:
-            return
-        container_layout = self.device_containers[dev_idx].layout()
-        for i in range(8):
-            color = NEON_COLORS[i % len(NEON_COLORS)]
-
-            row = QtWidgets.QHBoxLayout()
-            row.setSpacing(4)
-            row.setContentsMargins(0, 0, 0, 0)
-
-            label = QtWidgets.QLabel(f"Ch{i+1}")
-            label.setFixedWidth(35)
-            label.setStyleSheet(
-                f"color: {color}; font-weight: bold; font-size: 9pt;"
-            )
-            row.addWidget(label)
-
-            pw = pg.PlotWidget()
-            pw.setMinimumHeight(70)
-            pw.setMaximumHeight(90)
-            pw.setBackground(PLOT_BG)
-            pw.showGrid(x=True, y=True, alpha=0.2)
-            pw.getAxis('left').setPen(pg.mkPen(color='#555'))
-            pw.getAxis('bottom').setPen(pg.mkPen(color='#555'))
-            pw.getAxis('left').setTextPen(pg.mkPen(color='#888'))
-            pw.getAxis('bottom').setTextPen(pg.mkPen(color='#888'))
-            pw.setXRange(0, self.parent_viz.window_seconds)
-            pw.setYRange(-500000, 500000)
-            pw.setClipToView(True)
-            pw.setDownsampling(mode='peak')
-
-            curve = pw.plot(pen=pg.mkPen(color=color, width=1))
-            self.device_plots[dev_idx].append(pw)
-            self.device_curves[dev_idx].append(curve)
-
-            row.addWidget(pw)
-            container_layout.addLayout(row)
-
-        self.device_created[dev_idx] = True
-
-    def _dev_btn_style(self, active):
-        if active:
-            return f"""
-                QPushButton {{
-                    background-color: {self.color};
-                    color: #0d0d0d;
-                    border: 1px solid {self.color};
-                    border-radius: 4px;
-                    padding: 4px 2px;
-                    font-size: 9pt;
-                    font-weight: bold;
-                }}
-                QPushButton:hover {{
-                    background-color: {self.color};
-                }}
-            """
-        else:
-            return f"""
-                QPushButton {{
-                    background-color: #1a1a1a;
-                    color: {self.color};
-                    border: 1px solid {self.color};
-                    border-radius: 4px;
-                    padding: 4px 2px;
-                    font-size: 9pt;
-                }}
-                QPushButton:hover {{
-                    background-color: #2a2a2a;
-                }}
-            """
-
-    def select_device(self, dev_idx):
-        """Toggle a device's plots. Only one device shown at a time per port."""
-        if self.active_device == dev_idx:
-            # Clicking active device hides it
-            self.device_containers[dev_idx].setVisible(False)
-            self.device_buttons[dev_idx].setStyleSheet(self._dev_btn_style(False))
-            self._dev_stuck_state[dev_idx] = False
-            self.active_device = None
-            return
-
-        # Hide previously active device
-        if self.active_device is not None:
-            self.device_containers[self.active_device].setVisible(False)
-            self.device_buttons[self.active_device].setStyleSheet(
-                self._dev_btn_style(False)
-            )
-            self._dev_stuck_state[self.active_device] = False
-
-        # Show new device
-        self._create_device_plots(dev_idx)
-        self.device_containers[dev_idx].setVisible(True)
-        self.device_buttons[dev_idx].setStyleSheet(self._dev_btn_style(True))
-        self._dev_stuck_state[dev_idx] = False
-        self.active_device = dev_idx
-
-    def _dev_btn_stuck_style(self):
-        return """
-            QPushButton {
-                background-color: #440000;
-                color: #ff4444;
-                border: 2px solid #ff0000;
-                border-radius: 4px;
-                padding: 4px 2px;
-                font-size: 9pt;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #550000;
-            }
-        """
-
-    def update_stuck_indicators(self, stuck_channels):
-        """Color device buttons red when any of their 8 channels are stuck.
-        Only calls setStyleSheet when a button's stuck state actually changes."""
-        for d in range(self.num_devices):
-            dev_ch_start = self.start_ch_idx + d * 8
-            dev_stuck = any(
-                ch_idx in stuck_channels
-                for ch_idx in range(dev_ch_start, dev_ch_start + 8)
-            )
-            was_stuck = self._dev_stuck_state[d]
-            if dev_stuck == was_stuck:
-                continue
-            self._dev_stuck_state[d] = dev_stuck
-            if dev_stuck:
-                self.device_buttons[d].setStyleSheet(self._dev_btn_stuck_style())
-            else:
-                is_active = (self.active_device == d)
-                self.device_buttons[d].setStyleSheet(self._dev_btn_style(is_active))
-
-    def update_plots(self, x_min, x_max, rescale_y):
-        if self.active_device is None:
-            return
-        dev = self.active_device
-        if not self.device_created[dev]:
-            return
-
-        viz = self.parent_viz
-        start = viz.buf_idx - viz.buf_count
-        end = viz.buf_idx
-        if start < 0 or end <= start:
-            return
-
-        # Channel offset for this device within all_channels
-        dev_ch_start = self.start_ch_idx + dev * 8
-
-        for i, curve in enumerate(self.device_curves[dev]):
-            ch_idx = dev_ch_start + i
-            if ch_idx >= viz.total_channels:
-                break
-
-            t = viz.time_buf[ch_idx, start:end]
-            d = viz.data_buf[ch_idx, start:end]
-            curve.setData(t, d)
-
-            self.device_plots[dev][i].setXRange(x_min, x_max, padding=0)
-
-            if rescale_y and len(d) > 0:
-                y_min, y_max = float(d.min()), float(d.max())
-                margin = max((y_max - y_min) * 0.1, 10000)
-                self.device_plots[dev][i].setYRange(
-                    y_min - margin, y_max + margin, padding=0
-                )
-
-
-# ============================================================================
 # MAIN VISUALIZER
 # ============================================================================
 
 class SignalVisualizer(QtWidgets.QMainWindow):
-    """Real-time EEG signal visualizer with side-by-side port columns."""
+    """Real-time EEG signal visualizer with port/device selector and 8-channel view."""
+
+    # Desired left-to-right display order for port buttons.
+    # Ports not listed here will be appended at the end in their natural order.
+    DISPLAY_ORDER = ["Port4", "Port3", "Port2", "Port1", "Port7", "Port6", "Port5"]
 
     def __init__(self, host, port, spi_ports, window_seconds=5.0,
                  csv_enabled=True, csv_dir='.'):
@@ -593,14 +330,63 @@ class SignalVisualizer(QtWidgets.QMainWindow):
         self.csv_enabled = csv_enabled
         self.csv_dir = csv_dir
         self.sample_rate = 250
-        self.max_samples = int(self.sample_rate * window_seconds)
-        self.notch_on = True
+        self.max_window_seconds = 30  # Slider max
+        self.max_samples = int(self.sample_rate * self.max_window_seconds)
+        self.gain = GAIN
+        self.lsb_uv = (VREF / (2**23) / self.gain) * 1e6
 
-        # 60 Hz notch filter coefficients (constant)
-        self.notch_b, self.notch_a = sig.iirnotch(
+        self.notch60_on = True
+        self.notch50_on = False
+        self.notch70_on = False
+        self.notch80_on = False
+        self.notch120_on = False
+        self.lpf_on = False
+        self.hpf_on = False
+        self.cmf_on = False
+        self.y_autoscale = False
+        self.y_fixed_range = 200  # uV
+
+        # 60 Hz notch filter coefficients
+        self.notch60_b, self.notch60_a = sig.iirnotch(
             60.0, Q=30.0, fs=self.sample_rate
         )
-        self.notch_zi_template = sig.lfilter_zi(self.notch_b, self.notch_a)
+        self.notch60_zi_template = sig.lfilter_zi(self.notch60_b, self.notch60_a)
+
+        # 50 Hz notch filter coefficients
+        self.notch50_b, self.notch50_a = sig.iirnotch(
+            50.0, Q=30.0, fs=self.sample_rate
+        )
+        self.notch50_zi_template = sig.lfilter_zi(self.notch50_b, self.notch50_a)
+
+        # 70 Hz notch filter coefficients
+        self.notch70_b, self.notch70_a = sig.iirnotch(
+            70.0, Q=30.0, fs=self.sample_rate
+        )
+        self.notch70_zi_template = sig.lfilter_zi(self.notch70_b, self.notch70_a)
+
+        # 80 Hz notch filter coefficients
+        self.notch80_b, self.notch80_a = sig.iirnotch(
+            80.0, Q=30.0, fs=self.sample_rate
+        )
+        self.notch80_zi_template = sig.lfilter_zi(self.notch80_b, self.notch80_a)
+
+        # 120 Hz notch filter coefficients
+        self.notch120_b, self.notch120_a = sig.iirnotch(
+            120.0, Q=30.0, fs=self.sample_rate
+        )
+        self.notch120_zi_template = sig.lfilter_zi(self.notch120_b, self.notch120_a)
+
+        # 50 Hz low-pass filter coefficients (10th-order Butterworth, SOS form)
+        self.lpf_sos = sig.butter(
+            10, 50.0, btype='low', fs=self.sample_rate, output='sos'
+        )
+        self.lpf_zi_template = sig.sosfilt_zi(self.lpf_sos)
+
+        # 1 Hz high-pass filter coefficients (10th-order Butterworth, SOS form)
+        self.hpf_sos = sig.butter(
+            10, 1.0, btype='high', fs=self.sample_rate, output='sos'
+        )
+        self.hpf_zi_template = sig.sosfilt_zi(self.hpf_sos)
 
         # Thread-safe queue for cross-thread sample transfer
         self.sample_queue = Queue(maxsize=5000)
@@ -610,7 +396,34 @@ class SignalVisualizer(QtWidgets.QMainWindow):
 
         self._init_data_state()
 
-        self.port_columns: List[PortColumn] = []
+        # Port/device selection state
+        # _selected_port_display_idx: index into _display_order_indices (which port button is active)
+        # _selected_device_idx: device index (0-based) within the selected port
+        self._selected_port_display_idx = None
+        self._selected_device_idx = None
+
+        # Computed mapping from display order to data order
+        # _display_order_indices[i] = index into self.spi_ports for the i-th displayed port
+        self._display_order_indices = []
+        # _port_ch_offsets[orig_idx] = channel offset in data buffer for spi_ports[orig_idx]
+        self._port_ch_offsets = []
+
+        # UI element lists (populated in setup_ui / _rebuild_selectors)
+        self._port_buttons: List[QtWidgets.QPushButton] = []
+        self._port_button_colors: List[str] = []  # color for each port button (display order)
+        self._port_stuck_state: List[bool] = []  # per port button stuck state
+        self._device_buttons: List[QtWidgets.QPushButton] = []
+        self._device_stuck_state: List[bool] = []
+
+        # 8 persistent plot widgets + curves (created once in setup_ui)
+        self._plot_widgets: List[pg.PlotWidget] = []
+        self._plot_curves: List[pg.PlotDataItem] = []
+        self._ch_labels: List[QtWidgets.QLabel] = []
+
+        # Smoothed Y-axis ranges for autoscale (per plot)
+        self._y_smooth_min = [0.0] * 8
+        self._y_smooth_max = [0.0] * 8
+
         self.setup_ui()
 
         self.network_thread = NetworkThread(self, host, port)
@@ -634,7 +447,7 @@ class SignalVisualizer(QtWidgets.QMainWindow):
         self.buf_count = 0
 
         self.pending_samples = deque()
-        self.buffer_delay = 1.5
+        self.buffer_delay = 0.25
         self.playback_wall_start = None
         self.playback_server_start = None
 
@@ -642,8 +455,26 @@ class SignalVisualizer(QtWidgets.QMainWindow):
         self.sample_count = 0
         self.frame_count = 0
 
-        self.notch_states = [
-            self.notch_zi_template.copy() for _ in range(self.total_channels)
+        self.notch60_states = [
+            self.notch60_zi_template.copy() for _ in range(self.total_channels)
+        ]
+        self.notch50_states = [
+            self.notch50_zi_template.copy() for _ in range(self.total_channels)
+        ]
+        self.notch70_states = [
+            self.notch70_zi_template.copy() for _ in range(self.total_channels)
+        ]
+        self.notch80_states = [
+            self.notch80_zi_template.copy() for _ in range(self.total_channels)
+        ]
+        self.notch120_states = [
+            self.notch120_zi_template.copy() for _ in range(self.total_channels)
+        ]
+        self.lpf_states = [
+            self.lpf_zi_template.copy() for _ in range(self.total_channels)
+        ]
+        self.hpf_states = [
+            self.hpf_zi_template.copy() for _ in range(self.total_channels)
         ]
 
         # Stuck channel detection
@@ -676,37 +507,10 @@ class SignalVisualizer(QtWidgets.QMainWindow):
                 break
 
         self._init_data_state()
-        self._rebuild_port_columns()
+        self._rebuild_selectors()
 
         # Start CSV writer with the new port config
         self._start_csv_writer(port_configs)
-
-    def _build_port_columns(self):
-        """Create PortColumn widgets for current spi_ports config."""
-        ch_offset = 0
-        for idx, pc in enumerate(self.spi_ports):
-            color = PORT_COLORS[idx % len(PORT_COLORS)]
-            col = PortColumn(pc, ch_offset, color, self)
-            self.port_columns.append(col)
-            self.columns_layout.addWidget(col, stretch=1,
-                                          alignment=QtCore.Qt.AlignTop)
-            ch_offset += pc.num_channels
-
-    def _rebuild_port_columns(self):
-        """Remove old port columns and create new ones for updated config."""
-        for col in self.port_columns:
-            self.columns_layout.removeWidget(col)
-            col.setParent(None)
-            col.deleteLater()
-        self.port_columns.clear()
-        self._build_port_columns()
-
-        total_dev = sum(p.num_devices for p in self.spi_ports)
-        total_ch = sum(p.num_channels for p in self.spi_ports)
-        self.status.setText(
-            f"Configured: {len(self.spi_ports)} ports, "
-            f"{total_dev} devices, {total_ch} channels"
-        )
 
     def _start_csv_writer(self, port_configs):
         """Start (or restart) the CSV writer with the given port configuration."""
@@ -724,18 +528,21 @@ class SignalVisualizer(QtWidgets.QMainWindow):
         # Tell network thread about the new writer
         self.network_thread.csv_writer = self.csv_writer
 
+    # ------------------------------------------------------------------
+    # UI SETUP
+    # ------------------------------------------------------------------
+
     def setup_ui(self):
         self.setWindowTitle('ADS1299 Signal Visualizer')
-        self.setGeometry(100, 100, 1400, 900)
         self.setStyleSheet(STYLESHEET)
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         layout = QtWidgets.QVBoxLayout(central)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(6)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
 
-        # Top bar: status + notch toggle
+        # --- Top bar: status + notch toggle ---
         top_bar = QtWidgets.QHBoxLayout()
         self.status = QtWidgets.QLabel('Connecting...')
         self.status.setStyleSheet(
@@ -743,15 +550,125 @@ class SignalVisualizer(QtWidgets.QMainWindow):
         )
         top_bar.addWidget(self.status, stretch=1)
 
-        self.notch_btn = QtWidgets.QPushButton('60Hz Notch: ON')
-        self.notch_btn.setStyleSheet(
+        self.notch50_btn = QtWidgets.QPushButton('50Hz Notch: OFF')
+        self.notch50_btn.setStyleSheet(
+            'background-color: #2a2a2a; color: #aaa; padding: 6px 14px;'
+        )
+        self.notch50_btn.clicked.connect(self.toggle_notch50)
+        top_bar.addWidget(self.notch50_btn)
+
+        self.notch60_btn = QtWidgets.QPushButton('60Hz Notch: ON')
+        self.notch60_btn.setStyleSheet(
             'background-color: #00aa55; color: white; padding: 6px 14px;'
         )
-        self.notch_btn.clicked.connect(self.toggle_notch)
-        top_bar.addWidget(self.notch_btn)
+        self.notch60_btn.clicked.connect(self.toggle_notch60)
+        top_bar.addWidget(self.notch60_btn)
+
+        self.notch120_btn = QtWidgets.QPushButton('120Hz Notch: OFF')
+        self.notch120_btn.setStyleSheet(
+            'background-color: #2a2a2a; color: #aaa; padding: 6px 14px;'
+        )
+        self.notch120_btn.clicked.connect(self.toggle_notch120)
+        top_bar.addWidget(self.notch120_btn)
+
+        self.lpf_btn = QtWidgets.QPushButton('50Hz LPF: OFF')
+        self.lpf_btn.setStyleSheet(
+            'background-color: #2a2a2a; color: #aaa; padding: 6px 14px;'
+        )
+        self.lpf_btn.clicked.connect(self.toggle_lpf)
+        top_bar.addWidget(self.lpf_btn)
+
+        self.hpf_btn = QtWidgets.QPushButton('1Hz HPF: OFF')
+        self.hpf_btn.setStyleSheet(
+            'background-color: #2a2a2a; color: #aaa; padding: 6px 14px;'
+        )
+        self.hpf_btn.clicked.connect(self.toggle_hpf)
+        top_bar.addWidget(self.hpf_btn)
+
+        self.yscale_btn = QtWidgets.QPushButton('Y: \u00b15000')
+        self.yscale_btn.setStyleSheet(
+            'background-color: #00aa55; color: white; padding: 6px 14px;'
+        )
+        self.yscale_btn.clicked.connect(self.toggle_yscale)
+        top_bar.addWidget(self.yscale_btn)
+
+        self.yrange_input = QtWidgets.QLineEdit('200')
+        self.yrange_input.setFixedWidth(60)
+        self.yrange_input.setStyleSheet(
+            'background-color: #2a2a2a; color: #e0e0e0; border: 1px solid #444; '
+            'border-radius: 4px; padding: 4px; font-size: 10pt;'
+        )
+        self.yrange_input.returnPressed.connect(self._apply_yrange)
+        top_bar.addWidget(self.yrange_input)
+
+        self.cmf_btn = QtWidgets.QPushButton('CMF: OFF')
+        self.cmf_btn.setStyleSheet(
+            'background-color: #2a2a2a; color: #aaa; padding: 6px 14px;'
+        )
+        self.cmf_btn.clicked.connect(self.toggle_cmf)
+        top_bar.addWidget(self.cmf_btn)
+
+        gain_label = QtWidgets.QLabel('Gain:')
+        gain_label.setStyleSheet(f"color: {TEXT_COLOR}; font-size: 10pt;")
+        top_bar.addWidget(gain_label)
+
+        self.gain_combo = QtWidgets.QComboBox()
+        self.gain_combo.addItems(['1', '2', '4', '6', '8', '12', '24'])
+        self.gain_combo.setCurrentText(str(self.gain))
+        self.gain_combo.setStyleSheet(
+            'background-color: #2a2a2a; color: #e0e0e0; border: 1px solid #444; '
+            'border-radius: 4px; padding: 4px 8px; font-size: 10pt; '
+            'selection-background-color: #00aa55;'
+        )
+        self.gain_combo.setFixedWidth(60)
+        self.gain_combo.currentTextChanged.connect(self._on_gain_changed)
+        top_bar.addWidget(self.gain_combo)
+
         layout.addLayout(top_bar)
 
-        # Stuck channel warning banner (hidden by default)
+        # --- Time window slider ---
+        time_bar = QtWidgets.QHBoxLayout()
+        time_bar.setSpacing(4)
+
+        time_label = QtWidgets.QLabel('Window:')
+        time_label.setStyleSheet(f"color: {TEXT_COLOR}; font-size: 10pt;")
+        time_label.setFixedWidth(55)
+        time_bar.addWidget(time_label)
+
+        self.time_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.time_slider.setMinimum(1)    # 1 second
+        self.time_slider.setMaximum(30)   # 30 seconds
+        self.time_slider.setValue(int(self.window_seconds))
+        self.time_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        self.time_slider.setTickInterval(5)
+        self.time_slider.setStyleSheet(f"""
+            QSlider::groove:horizontal {{
+                background: #2a2a2a;
+                height: 6px;
+                border-radius: 3px;
+            }}
+            QSlider::handle:horizontal {{
+                background: {ACCENT_COLOR};
+                width: 14px;
+                margin: -5px 0;
+                border-radius: 7px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: #00aa55;
+                border-radius: 3px;
+            }}
+        """)
+        self.time_slider.valueChanged.connect(self._on_time_window_changed)
+        time_bar.addWidget(self.time_slider, stretch=1)
+
+        self.time_value_label = QtWidgets.QLabel(f'{int(self.window_seconds)}s')
+        self.time_value_label.setStyleSheet(f"color: {ACCENT_COLOR}; font-size: 10pt; font-weight: bold;")
+        self.time_value_label.setFixedWidth(30)
+        time_bar.addWidget(self.time_value_label)
+
+        layout.addLayout(time_bar)
+
+        # --- Stuck channel warning banner (hidden by default) ---
         self.stuck_banner = QtWidgets.QLabel('')
         self.stuck_banner.setStyleSheet(
             'background-color: #440000; color: #ff4444; font-size: 11pt; '
@@ -762,28 +679,469 @@ class SignalVisualizer(QtWidgets.QMainWindow):
         self.stuck_banner.setWordWrap(True)
         layout.addWidget(self.stuck_banner)
 
-        # Port columns — side by side, each with button + plots below
-        columns_widget = QtWidgets.QWidget()
-        self.columns_layout = QtWidgets.QHBoxLayout()
-        self.columns_layout.setSpacing(6)
-        self.columns_layout.setContentsMargins(0, 0, 0, 0)
+        # --- Port buttons row ---
+        self._port_buttons_container = QtWidgets.QWidget()
+        self._port_buttons_layout = QtWidgets.QHBoxLayout()
+        self._port_buttons_layout.setSpacing(4)
+        self._port_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        self._port_buttons_container.setLayout(self._port_buttons_layout)
+        layout.addWidget(self._port_buttons_container)
 
-        self._build_port_columns()
+        # --- Device buttons row ---
+        self._device_buttons_container = QtWidgets.QWidget()
+        self._device_buttons_layout = QtWidgets.QHBoxLayout()
+        self._device_buttons_layout.setSpacing(4)
+        self._device_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        self._device_buttons_container.setLayout(self._device_buttons_layout)
+        self._device_buttons_container.setVisible(False)
+        layout.addWidget(self._device_buttons_container)
 
-        columns_widget.setLayout(self.columns_layout)
+        # --- 8 channel plots (always exist, data source changes) ---
+        plots_widget = QtWidgets.QWidget()
+        plots_layout = QtWidgets.QVBoxLayout()
+        plots_layout.setContentsMargins(0, 2, 0, 0)
+        plots_layout.setSpacing(1)
+        plots_widget.setLayout(plots_layout)
 
-        # Wrap in a scroll area so expanded plots can use full height
-        columns_scroll = QtWidgets.QScrollArea()
-        columns_scroll.setWidgetResizable(True)
-        columns_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        columns_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        columns_scroll.setWidget(columns_widget)
-        layout.addWidget(columns_scroll, stretch=1)
+        for i in range(8):
+            color = NEON_COLORS[i % len(NEON_COLORS)]
+
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(4)
+            row.setContentsMargins(0, 0, 0, 0)
+
+            label = QtWidgets.QLabel(f"Ch{i+1}")
+            label.setFixedWidth(36)
+            label.setStyleSheet(
+                f"color: {color}; font-weight: bold; font-size: 9pt;"
+            )
+            row.addWidget(label)
+            self._ch_labels.append(label)
+
+            pw = pg.PlotWidget()
+            pw.setSizePolicy(
+                QtWidgets.QSizePolicy.Expanding,
+                QtWidgets.QSizePolicy.Expanding,
+            )
+            pw.setBackground(PLOT_BG)
+            pw.showGrid(x=True, y=True, alpha=0.2)
+            pw.getAxis('left').setPen(pg.mkPen(color='#555'))
+            pw.getAxis('left').setTextPen(pg.mkPen(color='#888'))
+            pw.getAxis('left').setWidth(50)
+            # Hide bottom axis on channels 1-7; only channel 8 shows time axis
+            if i < 7:
+                pw.getAxis('bottom').setHeight(0)
+                pw.getAxis('bottom').setStyle(showValues=False)
+            else:
+                pw.getAxis('bottom').setPen(pg.mkPen(color='#555'))
+                pw.getAxis('bottom').setTextPen(pg.mkPen(color='#888'))
+            pw.setXRange(0, self.window_seconds)
+            pw.setYRange(-self.y_fixed_range, self.y_fixed_range)
+            pw.setClipToView(True)
+            pw.setDownsampling(mode='peak')
+
+            curve = pw.plot(pen=pg.mkPen(color=color, width=1))
+            self._plot_widgets.append(pw)
+            self._plot_curves.append(curve)
+
+            row.addWidget(pw, stretch=1)
+            plots_layout.addLayout(row, stretch=1)
+
+        layout.addWidget(plots_widget, stretch=1)
+
+        # Build port buttons for initial config (may be empty)
+        self._build_selectors()
+
+    # ------------------------------------------------------------------
+    # PORT/DEVICE SELECTOR MANAGEMENT
+    # ------------------------------------------------------------------
+
+    def _compute_display_order(self):
+        """Compute display order indices and channel offsets for current spi_ports."""
+        # Channel offsets in data buffer (original order)
+        self._port_ch_offsets = []
+        ch_offset = 0
+        for pc in self.spi_ports:
+            self._port_ch_offsets.append(ch_offset)
+            ch_offset += pc.num_channels
+
+        # Build name -> original index lookup
+        port_lookup = {}
+        for idx, pc in enumerate(self.spi_ports):
+            port_lookup[pc.name] = idx
+
+        # Display order: DISPLAY_ORDER first, then any remaining
+        ordered_orig_indices = []
+        for name in self.DISPLAY_ORDER:
+            if name in port_lookup:
+                ordered_orig_indices.append(port_lookup[name])
+        for idx, pc in enumerate(self.spi_ports):
+            if idx not in ordered_orig_indices:
+                ordered_orig_indices.append(idx)
+
+        self._display_order_indices = ordered_orig_indices
+
+    def _build_selectors(self):
+        """Create port buttons for the current spi_ports config."""
+        self._compute_display_order()
+        self._port_buttons.clear()
+        self._port_button_colors.clear()
+        self._port_stuck_state.clear()
+
+        for display_idx, orig_idx in enumerate(self._display_order_indices):
+            pc = self.spi_ports[orig_idx]
+            color = PORT_COLORS[orig_idx % len(PORT_COLORS)]
+            self._port_button_colors.append(color)
+            self._port_stuck_state.append(False)
+
+            btn = QtWidgets.QPushButton(pc.name)
+            btn.setStyleSheet(self._port_btn_style(color, active=False))
+            btn.setSizePolicy(
+                QtWidgets.QSizePolicy.Expanding,
+                QtWidgets.QSizePolicy.Fixed,
+            )
+            btn.setMinimumHeight(36)
+            btn.clicked.connect(
+                lambda checked, di=display_idx: self._select_port(di)
+            )
+            self._port_buttons.append(btn)
+            self._port_buttons_layout.addWidget(btn)
+
+        # Auto-select the first port if any exist
+        if self._display_order_indices:
+            self._select_port(0)
+
+    def _rebuild_selectors(self):
+        """Remove old port/device buttons and recreate for updated config."""
+        # Clear port buttons
+        for btn in self._port_buttons:
+            self._port_buttons_layout.removeWidget(btn)
+            btn.setParent(None)
+            btn.deleteLater()
+        self._port_buttons.clear()
+        self._port_button_colors.clear()
+        self._port_stuck_state.clear()
+
+        # Clear device buttons
+        self._clear_device_buttons()
+        self._device_buttons_container.setVisible(False)
+
+        # Reset selection
+        self._selected_port_display_idx = None
+        self._selected_device_idx = None
+
+        # Rebuild
+        self._build_selectors()
+
+        # Update status
+        total_dev = sum(p.num_devices for p in self.spi_ports)
+        total_ch = sum(p.num_channels for p in self.spi_ports)
+        self.status.setText(
+            f"Configured: {len(self.spi_ports)} ports, "
+            f"{total_dev} devices, {total_ch} channels"
+        )
+
+    def _clear_device_buttons(self):
+        """Remove all device buttons from the device row."""
+        for btn in self._device_buttons:
+            self._device_buttons_layout.removeWidget(btn)
+            btn.setParent(None)
+            btn.deleteLater()
+        self._device_buttons.clear()
+        self._device_stuck_state.clear()
+
+    def _select_port(self, display_idx):
+        """Handle port button click. Highlight the selected port, update device buttons."""
+        if display_idx == self._selected_port_display_idx:
+            return  # already selected
+
+        # Update button styles: deactivate old, activate new
+        if self._selected_port_display_idx is not None:
+            old_idx = self._selected_port_display_idx
+            old_color = self._port_button_colors[old_idx]
+            if self._port_stuck_state[old_idx]:
+                self._port_buttons[old_idx].setStyleSheet(
+                    self._port_btn_stuck_style(active=False)
+                )
+            else:
+                self._port_buttons[old_idx].setStyleSheet(
+                    self._port_btn_style(old_color, active=False)
+                )
+
+        self._selected_port_display_idx = display_idx
+        new_color = self._port_button_colors[display_idx]
+        if self._port_stuck_state[display_idx]:
+            self._port_buttons[display_idx].setStyleSheet(
+                self._port_btn_stuck_style(active=True)
+            )
+        else:
+            self._port_buttons[display_idx].setStyleSheet(
+                self._port_btn_style(new_color, active=True)
+            )
+
+        # Rebuild device buttons for this port
+        self._update_device_buttons()
+
+    def _update_device_buttons(self):
+        """Rebuild device buttons row for the currently selected port."""
+        self._clear_device_buttons()
+
+        if self._selected_port_display_idx is None:
+            self._device_buttons_container.setVisible(False)
+            return
+
+        orig_idx = self._display_order_indices[self._selected_port_display_idx]
+        pc = self.spi_ports[orig_idx]
+        color = self._port_button_colors[self._selected_port_display_idx]
+
+        for d in range(pc.num_devices):
+            self._device_stuck_state.append(False)
+            btn = QtWidgets.QPushButton(f"Dev {d+1}")
+            btn.setStyleSheet(self._dev_btn_style(color, active=False))
+            btn.setSizePolicy(
+                QtWidgets.QSizePolicy.Expanding,
+                QtWidgets.QSizePolicy.Fixed,
+            )
+            btn.setMinimumHeight(32)
+            btn.clicked.connect(
+                lambda checked, di=d: self._select_device(di)
+            )
+            self._device_buttons.append(btn)
+            self._device_buttons_layout.addWidget(btn)
+
+        self._device_buttons_container.setVisible(True)
+
+        # Auto-select device 0
+        self._selected_device_idx = None
+        self._select_device(0)
+
+    def _select_device(self, dev_idx):
+        """Handle device button click. Highlight the selected device, update plots."""
+        if self._selected_port_display_idx is None:
+            return
+
+        color = self._port_button_colors[self._selected_port_display_idx]
+
+        # Deactivate old device button
+        if self._selected_device_idx is not None and self._selected_device_idx < len(self._device_buttons):
+            old_idx = self._selected_device_idx
+            if self._device_stuck_state[old_idx]:
+                self._device_buttons[old_idx].setStyleSheet(
+                    self._dev_btn_stuck_style()
+                )
+            else:
+                self._device_buttons[old_idx].setStyleSheet(
+                    self._dev_btn_style(color, active=False)
+                )
+
+        self._selected_device_idx = dev_idx
+
+        # Activate new device button
+        if dev_idx < len(self._device_buttons):
+            if self._device_stuck_state[dev_idx]:
+                self._device_buttons[dev_idx].setStyleSheet(
+                    self._dev_btn_stuck_style()
+                )
+            else:
+                self._device_buttons[dev_idx].setStyleSheet(
+                    self._dev_btn_style(color, active=True)
+                )
+
+        # Clear plot data immediately so stale traces don't linger
+        for curve in self._plot_curves:
+            curve.setData([], [])
+
+    # ------------------------------------------------------------------
+    # BUTTON STYLE HELPERS
+    # ------------------------------------------------------------------
+
+    def _port_btn_style(self, color, active):
+        if active:
+            return f"""
+                QPushButton {{
+                    background-color: {color};
+                    color: #0d0d0d;
+                    border: 2px solid {color};
+                    border-radius: 6px;
+                    padding: 6px 10px;
+                    font-size: 11pt;
+                    font-weight: bold;
+                }}
+                QPushButton:hover {{
+                    background-color: {color};
+                }}
+            """
+        else:
+            return f"""
+                QPushButton {{
+                    background-color: #1a1a1a;
+                    color: {color};
+                    border: 2px solid {color};
+                    border-radius: 6px;
+                    padding: 6px 10px;
+                    font-size: 11pt;
+                    font-weight: bold;
+                }}
+                QPushButton:hover {{
+                    background-color: #2a2a2a;
+                }}
+            """
+
+    def _port_btn_stuck_style(self, active):
+        if active:
+            return """
+                QPushButton {
+                    background-color: #880000;
+                    color: #ff4444;
+                    border: 2px solid #ff0000;
+                    border-radius: 6px;
+                    padding: 6px 10px;
+                    font-size: 11pt;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #990000;
+                }
+            """
+        else:
+            return """
+                QPushButton {
+                    background-color: #440000;
+                    color: #ff4444;
+                    border: 2px solid #ff0000;
+                    border-radius: 6px;
+                    padding: 6px 10px;
+                    font-size: 11pt;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #550000;
+                }
+            """
+
+    def _dev_btn_style(self, color, active):
+        if active:
+            return f"""
+                QPushButton {{
+                    background-color: {color};
+                    color: #0d0d0d;
+                    border: 1px solid {color};
+                    border-radius: 4px;
+                    padding: 4px 8px;
+                    font-size: 10pt;
+                    font-weight: bold;
+                }}
+                QPushButton:hover {{
+                    background-color: {color};
+                }}
+            """
+        else:
+            return f"""
+                QPushButton {{
+                    background-color: #1a1a1a;
+                    color: {color};
+                    border: 1px solid {color};
+                    border-radius: 4px;
+                    padding: 4px 8px;
+                    font-size: 10pt;
+                }}
+                QPushButton:hover {{
+                    background-color: #2a2a2a;
+                }}
+            """
+
+    def _dev_btn_stuck_style(self):
+        return """
+            QPushButton {
+                background-color: #440000;
+                color: #ff4444;
+                border: 2px solid #ff0000;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 10pt;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #550000;
+            }
+        """
+
+    # ------------------------------------------------------------------
+    # STUCK CHANNEL INDICATOR UPDATES
+    # ------------------------------------------------------------------
+
+    def _update_stuck_indicators(self, stuck_channels):
+        """Update port and device button styling based on stuck channel set.
+
+        Port button turns red if ANY channel in that port is stuck.
+        Device button turns red if ANY of its 8 channels are stuck.
+        Only calls setStyleSheet when state actually changes.
+        """
+        stuck_set = set(stuck_channels.keys())
+
+        # Update port buttons
+        for display_idx, orig_idx in enumerate(self._display_order_indices):
+            pc = self.spi_ports[orig_idx]
+            port_ch_start = self._port_ch_offsets[orig_idx]
+            port_ch_end = port_ch_start + pc.num_channels
+
+            port_stuck = any(
+                ch_idx in stuck_set
+                for ch_idx in range(port_ch_start, port_ch_end)
+            )
+            was_stuck = self._port_stuck_state[display_idx]
+            if port_stuck == was_stuck:
+                continue
+            self._port_stuck_state[display_idx] = port_stuck
+
+            is_active = (display_idx == self._selected_port_display_idx)
+            color = self._port_button_colors[display_idx]
+            if port_stuck:
+                self._port_buttons[display_idx].setStyleSheet(
+                    self._port_btn_stuck_style(active=is_active)
+                )
+            else:
+                self._port_buttons[display_idx].setStyleSheet(
+                    self._port_btn_style(color, active=is_active)
+                )
+
+        # Update device buttons (only for currently selected port)
+        if self._selected_port_display_idx is not None and self._device_buttons:
+            orig_idx = self._display_order_indices[self._selected_port_display_idx]
+            port_ch_start = self._port_ch_offsets[orig_idx]
+            color = self._port_button_colors[self._selected_port_display_idx]
+
+            for d in range(len(self._device_buttons)):
+                dev_ch_start = port_ch_start + d * 8
+                dev_stuck = any(
+                    ch_idx in stuck_set
+                    for ch_idx in range(dev_ch_start, dev_ch_start + 8)
+                )
+                if d >= len(self._device_stuck_state):
+                    break
+                was_stuck = self._device_stuck_state[d]
+                if dev_stuck == was_stuck:
+                    continue
+                self._device_stuck_state[d] = dev_stuck
+
+                is_active = (d == self._selected_device_idx)
+                if dev_stuck:
+                    self._device_buttons[d].setStyleSheet(
+                        self._dev_btn_stuck_style()
+                    )
+                else:
+                    self._device_buttons[d].setStyleSheet(
+                        self._dev_btn_style(color, active=is_active)
+                    )
+
+    # ------------------------------------------------------------------
+    # DATA PROCESSING (unchanged from original)
+    # ------------------------------------------------------------------
 
     def process_batch(self, samples):
         """Process multiple samples at once with vectorized notch filtering.
 
-        Instead of calling lfilter 224×50 = 11,200 times (once per channel per
+        Instead of calling lfilter 224x50 = 11,200 times (once per channel per
         sample), this calls it 224 times total, each processing the full batch.
         """
         n = len(samples)
@@ -796,21 +1154,70 @@ class SignalVisualizer(QtWidgets.QMainWindow):
         if self.start_time is None:
             self.start_time = time.time()
 
-        # Build numpy arrays from sample dicts
+        # Build numpy arrays from sample dicts and convert to microvolts
         timestamps = np.array([s['timestamp'] for s in samples])
         raw = np.zeros((n, num_ch))
         for i, s in enumerate(samples):
             ch = s['channels']
             ch_count = min(len(ch), num_ch)
             raw[i, :ch_count] = ch[:ch_count]
+        raw *= self.lsb_uv  # Convert ADC counts to microvolts
 
-        # Vectorized notch filter: one lfilter call per channel, n samples each
-        if self.notch_on:
+        # Vectorized filters: one lfilter call per channel, n samples each
+        if self.notch50_on:
             for c in range(num_ch):
-                raw[:, c], self.notch_states[c] = sig.lfilter(
-                    self.notch_b, self.notch_a, raw[:, c],
-                    zi=self.notch_states[c]
+                raw[:, c], self.notch50_states[c] = sig.lfilter(
+                    self.notch50_b, self.notch50_a, raw[:, c],
+                    zi=self.notch50_states[c]
                 )
+        if self.notch60_on:
+            for c in range(num_ch):
+                raw[:, c], self.notch60_states[c] = sig.lfilter(
+                    self.notch60_b, self.notch60_a, raw[:, c],
+                    zi=self.notch60_states[c]
+                )
+        if self.notch70_on:
+            for c in range(num_ch):
+                raw[:, c], self.notch70_states[c] = sig.lfilter(
+                    self.notch70_b, self.notch70_a, raw[:, c],
+                    zi=self.notch70_states[c]
+                )
+        if self.notch80_on:
+            for c in range(num_ch):
+                raw[:, c], self.notch80_states[c] = sig.lfilter(
+                    self.notch80_b, self.notch80_a, raw[:, c],
+                    zi=self.notch80_states[c]
+                )
+        if self.notch120_on:
+            for c in range(num_ch):
+                raw[:, c], self.notch120_states[c] = sig.lfilter(
+                    self.notch120_b, self.notch120_a, raw[:, c],
+                    zi=self.notch120_states[c]
+                )
+        if self.lpf_on:
+            for c in range(num_ch):
+                raw[:, c], self.lpf_states[c] = sig.sosfilt(
+                    self.lpf_sos, raw[:, c],
+                    zi=self.lpf_states[c]
+                )
+        if self.hpf_on:
+            for c in range(num_ch):
+                raw[:, c], self.hpf_states[c] = sig.sosfilt(
+                    self.hpf_sos, raw[:, c],
+                    zi=self.hpf_states[c]
+                )
+        if self.cmf_on:
+            ch_offset = 0
+            for port in self.spi_ports:
+                for dev in range(port.num_devices):
+                    dev_start = ch_offset + dev * 8
+                    dev_end = dev_start + 8
+                    if dev_end <= num_ch:
+                        dev_mean = raw[:, dev_start:dev_end].mean(
+                            axis=1, keepdims=True
+                        )
+                        raw[:, dev_start:dev_end] -= dev_mean
+                ch_offset += port.num_channels
 
         # Write batch to ring buffer, handling wrap-around
         idx = self.buf_idx
@@ -894,6 +1301,10 @@ class SignalVisualizer(QtWidgets.QMainWindow):
                 f'Samples: {self.sample_count}{csv_info}'
             )
 
+    # ------------------------------------------------------------------
+    # PLOT UPDATE
+    # ------------------------------------------------------------------
+
     def update_plots(self):
         """Buffered playback: absorb WiFi jitter, release samples at steady rate."""
         try:
@@ -932,7 +1343,7 @@ class SignalVisualizer(QtWidgets.QMainWindow):
                 return
 
             self.frame_count += 1
-            rescale_y = (self.frame_count % 15 == 0)
+            rescale_y = (self.frame_count % 3 == 0)
 
             # Compute X range from channel 0 timestamps
             start = self.buf_idx - self.buf_count
@@ -946,9 +1357,8 @@ class SignalVisualizer(QtWidgets.QMainWindow):
             else:
                 x_min, x_max = latest - self.window_seconds, latest
 
-            # Update only expanded columns
-            for col in self.port_columns:
-                col.update_plots(x_min, x_max, rescale_y)
+            # Update the 8 plots for the currently selected port + device
+            self._update_visible_plots(x_min, x_max, rescale_y)
 
             # Update stuck channel banner
             if self.stuck_channels:
@@ -972,38 +1382,170 @@ class SignalVisualizer(QtWidgets.QMainWindow):
                 self.stuck_banner.setVisible(True)
 
                 if rescale_y:
-                    for col in self.port_columns:
-                        col.update_stuck_indicators(self.stuck_channels)
+                    self._update_stuck_indicators(self.stuck_channels)
             else:
                 self.stuck_banner.setVisible(False)
                 if rescale_y:
-                    for col in self.port_columns:
-                        col.update_stuck_indicators({})
+                    self._update_stuck_indicators({})
 
         except Exception as e:
             print(f"[viz] update error: {e}")
             traceback.print_exc()
 
-    def toggle_notch(self):
-        self.notch_on = not self.notch_on
-        if self.notch_on:
-            self.notch_btn.setText('60Hz Notch: ON')
-            self.notch_btn.setStyleSheet(
+    def _update_visible_plots(self, x_min, x_max, rescale_y):
+        """Update the 8 plot widgets with data for the selected port + device."""
+        if self._selected_port_display_idx is None or self._selected_device_idx is None:
+            return
+
+        orig_idx = self._display_order_indices[self._selected_port_display_idx]
+        port_ch_start = self._port_ch_offsets[orig_idx]
+        dev_ch_start = port_ch_start + self._selected_device_idx * 8
+
+        buf_start = self.buf_idx - self.buf_count
+        buf_end = self.buf_idx
+        if buf_start < 0 or buf_end <= buf_start:
+            return
+
+        for i in range(8):
+            ch_idx = dev_ch_start + i
+            if ch_idx >= self.total_channels:
+                self._plot_curves[i].setData([], [])
+                continue
+
+            t = self.time_buf[ch_idx, buf_start:buf_end]
+            d = self.data_buf[ch_idx, buf_start:buf_end]
+            self._plot_curves[i].setData(t, d)
+
+            self._plot_widgets[i].setXRange(x_min, x_max, padding=0)
+
+            if rescale_y and len(d) > 0:
+                if self.y_autoscale:
+                    y_min, y_max = float(d.min()), float(d.max())
+                    margin = max((y_max - y_min) * 0.1, 10)  # uV
+                    target_min = y_min - margin
+                    target_max = y_max + margin
+                    alpha = 0.4
+                    self._y_smooth_min[i] += alpha * (target_min - self._y_smooth_min[i])
+                    self._y_smooth_max[i] += alpha * (target_max - self._y_smooth_max[i])
+                    self._plot_widgets[i].setYRange(
+                        self._y_smooth_min[i], self._y_smooth_max[i], padding=0
+                    )
+                else:
+                    self._plot_widgets[i].setYRange(
+                        -self.y_fixed_range, self.y_fixed_range, padding=0
+                    )
+
+    # ------------------------------------------------------------------
+    # NOTCH FILTER TOGGLE
+    # ------------------------------------------------------------------
+
+    def _toggle_filter(self, attr, btn, label):
+        """Generic toggle helper for notch/lpf buttons."""
+        state = not getattr(self, attr)
+        setattr(self, attr, state)
+        if state:
+            btn.setText(f'{label}: ON')
+            btn.setStyleSheet(
                 'background-color: #00aa55; color: white; padding: 6px 14px;'
             )
-            self.notch_states = [
-                self.notch_zi_template.copy()
+            # Reset filter states on enable
+            zi_attr = attr.replace('_on', '_zi_template')
+            states_attr = attr.replace('_on', '_states')
+            setattr(self, states_attr, [
+                getattr(self, zi_attr).copy()
                 for _ in range(self.total_channels)
-            ]
+            ])
         else:
-            self.notch_btn.setText('60Hz Notch: OFF')
-            self.notch_btn.setStyleSheet(
+            btn.setText(f'{label}: OFF')
+            btn.setStyleSheet(
                 'background-color: #2a2a2a; color: #aaa; padding: 6px 14px;'
             )
 
+    def toggle_notch50(self):
+        self._toggle_filter('notch50_on', self.notch50_btn, '50Hz Notch')
+
+    def toggle_notch60(self):
+        self._toggle_filter('notch60_on', self.notch60_btn, '60Hz Notch')
+
+    def toggle_notch70(self):
+        self._toggle_filter('notch70_on', self.notch70_btn, '70Hz Notch')
+
+    def toggle_notch80(self):
+        self._toggle_filter('notch80_on', self.notch80_btn, '80Hz Notch')
+
+    def toggle_notch120(self):
+        self._toggle_filter('notch120_on', self.notch120_btn, '120Hz Notch')
+
+    def toggle_lpf(self):
+        self._toggle_filter('lpf_on', self.lpf_btn, '50Hz LPF')
+
+    def toggle_hpf(self):
+        self._toggle_filter('hpf_on', self.hpf_btn, '1Hz HPF')
+
+    def toggle_cmf(self):
+        self.cmf_on = not self.cmf_on
+        if self.cmf_on:
+            self.cmf_btn.setText('CMF: ON')
+            self.cmf_btn.setStyleSheet(
+                'background-color: #00aa55; color: white; padding: 6px 14px;'
+            )
+        else:
+            self.cmf_btn.setText('CMF: OFF')
+            self.cmf_btn.setStyleSheet(
+                'background-color: #2a2a2a; color: #aaa; padding: 6px 14px;'
+            )
+
+    def _on_gain_changed(self, text):
+        try:
+            self.gain = int(text)
+            self.lsb_uv = (VREF / (2**23) / self.gain) * 1e6
+        except ValueError:
+            pass
+
+    def _on_time_window_changed(self, value):
+        """Update the display time window from slider."""
+        max_allowed = self.max_samples / self.sample_rate
+        self.window_seconds = min(float(value), max_allowed)
+        self.time_value_label.setText(f'{int(self.window_seconds)}s')
+
+    def toggle_yscale(self):
+        self.y_autoscale = not self.y_autoscale
+        if self.y_autoscale:
+            self.yscale_btn.setText('Y: Auto')
+            self.yscale_btn.setStyleSheet(
+                'background-color: #2a2a2a; color: #aaa; padding: 6px 14px;'
+            )
+        else:
+            self.yscale_btn.setText(f'Y: \u00b1{int(self.y_fixed_range)}')
+            self.yscale_btn.setStyleSheet(
+                'background-color: #00aa55; color: white; padding: 6px 14px;'
+            )
+            for pw in self._plot_widgets:
+                pw.setYRange(-self.y_fixed_range, self.y_fixed_range, padding=0)
+
+    def _apply_yrange(self):
+        try:
+            val = int(self.yrange_input.text())
+            if val > 0:
+                self.y_fixed_range = val
+                if not self.y_autoscale:
+                    self.yscale_btn.setText(f'Y: \u00b1{val}')
+                    for pw in self._plot_widgets:
+                        pw.setYRange(-val, val, padding=0)
+        except ValueError:
+            pass
+
     def keyPressEvent(self, event):
         if event.key() == QtCore.Qt.Key_N:
-            self.toggle_notch()
+            self.toggle_notch60()
+        elif event.key() == QtCore.Qt.Key_L:
+            self.toggle_lpf()
+        elif event.key() == QtCore.Qt.Key_H:
+            self.toggle_hpf()
+        elif event.key() == QtCore.Qt.Key_Y:
+            self.toggle_yscale()
+        elif event.key() == QtCore.Qt.Key_C:
+            self.toggle_cmf()
         else:
             super().keyPressEvent(event)
 
@@ -1070,10 +1612,8 @@ class NetworkThread(QtCore.QThread):
                 while self.running:
                     try:
                         header_data = self._recv_exact(sock, 8)
-                        compressed_size, sample_count = header_struct.unpack(header_data)
-                        compressed_data = self._recv_exact(sock, compressed_size)
-
-                        raw = lz4.frame.decompress(compressed_data)
+                        payload_size, sample_count = header_struct.unpack(header_data)
+                        raw = self._recv_exact(sock, payload_size)
                         for i in range(sample_count):
                             offset = i * sample_size
                             unpacked = sample_struct.unpack_from(raw, offset)
@@ -1153,7 +1693,7 @@ class NetworkThread(QtCore.QThread):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='ADS1299 signal visualizer with per-port columns',
+        description='ADS1299 signal visualizer with port/device selector',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Port configuration is auto-detected from the server.
@@ -1201,7 +1741,7 @@ SPI Port Format: "Name,NumDevices Name2,NumDevices2 ..."
         csv_enabled=not args.no_csv,
         csv_dir=args.csv_dir,
     )
-    viz.show()
+    viz.showMaximized()
 
     print(f"\nADS1299 Signal Visualizer")
     print(f"{'='*50}")

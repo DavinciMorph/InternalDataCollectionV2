@@ -17,8 +17,6 @@
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 
-#include <lz4frame.h>
-
 namespace ads1299 {
 
 static double clock_monotonic() {
@@ -39,11 +37,8 @@ StreamingServer::StreamingServer(const PortConfig* ports, int num_ports,
     , listen_fd_(-1)
     , client_fd_(-1)
     , batch_buf_(nullptr)
-    , lz4_buf_(nullptr)
     , frame_buf_(nullptr)
-    , lz4_cap_(0)
     , frame_cap_(0)
-    , lz4_ctx_(nullptr)
     , metadata_len_(0)
     , samples_sent_(0)
     , batches_sent_(0)
@@ -60,36 +55,19 @@ StreamingServer::StreamingServer(const PortConfig* ports, int num_ports,
                                         ports, num_ports,
                                         total_channels, total_devices);
 
-    // Pre-allocate batch buffer
+    // Pre-allocate batch buffer (accumulates packed samples before sending)
     batch_buf_ = static_cast<uint8_t*>(
         std::malloc(static_cast<size_t>(BATCH_SIZE) * wire_sample_size_));
 
-    // Pre-allocate LZ4 context (allocated once, reused per batch)
-    LZ4F_errorCode_t err = LZ4F_createCompressionContext(&lz4_ctx_, LZ4F_VERSION);
-    if (LZ4F_isError(err)) {
-        std::fprintf(stderr, "  [STREAM] LZ4 context creation failed: %s\n",
-                     LZ4F_getErrorName(err));
-        lz4_ctx_ = nullptr;
-    }
-
-    // LZ4 output buffer: compressFrameBound gives the total max for a complete frame
-    size_t max_payload = static_cast<size_t>(BATCH_SIZE) * wire_sample_size_;
-    lz4_cap_ = LZ4F_compressFrameBound(max_payload, nullptr);
-    lz4_buf_ = static_cast<uint8_t*>(std::malloc(lz4_cap_));
-
-    // Frame buffer: 8-byte wire header + max compressed size
-    frame_cap_ = 8 + lz4_cap_;
+    // Frame buffer: 8-byte wire header + max raw payload
+    frame_cap_ = 8 + static_cast<size_t>(BATCH_SIZE) * wire_sample_size_;
     frame_buf_ = static_cast<uint8_t*>(std::malloc(frame_cap_));
 }
 
 StreamingServer::~StreamingServer() {
     stop();
 
-    if (lz4_ctx_) {
-        LZ4F_freeCompressionContext(lz4_ctx_);
-    }
     std::free(batch_buf_);
-    std::free(lz4_buf_);
     std::free(frame_buf_);
 }
 
@@ -301,7 +279,7 @@ void StreamingServer::stream_loop() {
             last_recv_check = now;
         }
 
-        // Try to pop samples and accumulate into batch
+        // Pop samples and pack into batch buffer
         bool got_sample = ring_.try_pop(sample);
         if (got_sample) {
             size_t offset = static_cast<size_t>(batch_count) * wire_sample_size_;
@@ -316,53 +294,15 @@ void StreamingServer::stream_loop() {
                               (now - last_flush_time) * 1000.0 >= FLUSH_TIMEOUT_MS);
 
         if (batch_full || flush_timeout) {
-            size_t batch_bytes = static_cast<size_t>(batch_count) * wire_sample_size_;
-
-            // LZ4 streaming compression: compressBegin + compressUpdate + compressEnd
-            size_t hdr_sz = LZ4F_compressBegin(lz4_ctx_, lz4_buf_, lz4_cap_, nullptr);
-            if (LZ4F_isError(hdr_sz)) {
-                std::fprintf(stderr, "  [STREAM] LZ4 compressBegin error: %s\n",
-                             LZ4F_getErrorName(hdr_sz));
-                batch_count = 0;
-                last_flush_time = now;
-                continue;
-            }
-
-            size_t body_sz = LZ4F_compressUpdate(lz4_ctx_,
-                                                  lz4_buf_ + hdr_sz,
-                                                  lz4_cap_ - hdr_sz,
-                                                  batch_buf_, batch_bytes,
-                                                  nullptr);
-            if (LZ4F_isError(body_sz)) {
-                std::fprintf(stderr, "  [STREAM] LZ4 compressUpdate error: %s\n",
-                             LZ4F_getErrorName(body_sz));
-                batch_count = 0;
-                last_flush_time = now;
-                continue;
-            }
-
-            size_t ftr_sz = LZ4F_compressEnd(lz4_ctx_,
-                                              lz4_buf_ + hdr_sz + body_sz,
-                                              lz4_cap_ - hdr_sz - body_sz,
-                                              nullptr);
-            if (LZ4F_isError(ftr_sz)) {
-                std::fprintf(stderr, "  [STREAM] LZ4 compressEnd error: %s\n",
-                             LZ4F_getErrorName(ftr_sz));
-                batch_count = 0;
-                last_flush_time = now;
-                continue;
-            }
-
-            size_t compressed_size = hdr_sz + body_sz + ftr_sz;
-
-            // Build frame: [uint32 compressed_size][uint32 sample_count][lz4 data]
-            uint32_t cs = static_cast<uint32_t>(compressed_size);
+            // Build frame: [uint32 payload_size][uint32 sample_count][raw sample data]
+            size_t payload_size = static_cast<size_t>(batch_count) * wire_sample_size_;
+            uint32_t ps = static_cast<uint32_t>(payload_size);
             uint32_t sc = static_cast<uint32_t>(batch_count);
-            std::memcpy(frame_buf_, &cs, 4);
+            std::memcpy(frame_buf_, &ps, 4);
             std::memcpy(frame_buf_ + 4, &sc, 4);
-            std::memcpy(frame_buf_ + 8, lz4_buf_, compressed_size);
+            std::memcpy(frame_buf_ + 8, batch_buf_, payload_size);
 
-            size_t frame_size = 8 + compressed_size;
+            size_t frame_size = 8 + payload_size;
 
             bool ok = send_all(client_fd_, frame_buf_, frame_size, SEND_TIMEOUT_SEC);
             if (!ok) {

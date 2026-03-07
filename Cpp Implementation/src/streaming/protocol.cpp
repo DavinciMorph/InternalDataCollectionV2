@@ -59,7 +59,8 @@ int build_metadata_json(char* buf, size_t cap,
     int sample_size = 12 + total_channels * 4;
 
     int len = std::snprintf(buf, cap,
-        "{\"format\":\"binary_lz4\",\"batch_size\":%d,\"sample_rate\":250,"
+        "{\"format\":\"binary_raw\",\"compression\":\"none\","
+        "\"batch_size\":%d,\"sample_rate\":250,"
         "\"num_channels\":%d,\"num_devices\":%d,"
         "\"ports\":%s,\"port_config\":%s,"
         "\"sample_size\":%d,\"sample_struct\":\"<dI%di\"}\n",

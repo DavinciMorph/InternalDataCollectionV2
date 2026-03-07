@@ -8,7 +8,7 @@
 namespace ads1299 {
 
 // Streaming protocol constants
-constexpr int    BATCH_SIZE        = 10;
+constexpr int    BATCH_SIZE        = 1;
 constexpr int    FLUSH_TIMEOUT_MS  = 100;
 constexpr double SEND_TIMEOUT_SEC  = 2.0;
 constexpr int    LISTEN_BACKLOG    = 1;
