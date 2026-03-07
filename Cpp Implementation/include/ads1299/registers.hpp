@@ -45,18 +45,18 @@ enum class Reg : uint8_t {
 // TEST MODE values matching Python's ADS1299_Config defaults
 struct DeviceConfig {
     uint8_t config1    = 0x96;  // Daisy-chain mode, 250 SPS, external clock
-    uint8_t config2    = 0xD0;  // TEST MODE: internal test signal ON
+    uint8_t config2    = 0xC0;  // Normal mode: test signal OFF
     uint8_t config3    = 0xE0;  // Internal BIASREF, BIAS buffer off
     uint8_t config4    = 0x00;  // Continuous conversion, lead-off comp off
 
-    uint8_t ch1set     = 0x05;  // TEST MODE: gain=1, test signal input
-    uint8_t ch2set     = 0x05;
-    uint8_t ch3set     = 0x05;
-    uint8_t ch4set     = 0x05;
-    uint8_t ch5set     = 0x05;
-    uint8_t ch6set     = 0x05;
-    uint8_t ch7set     = 0x05;
-    uint8_t ch8set     = 0x05;
+    uint8_t ch1set     = 0x60;  // Normal input, gain=24
+    uint8_t ch2set     = 0x60;
+    uint8_t ch3set     = 0x60;
+    uint8_t ch4set     = 0x60;
+    uint8_t ch5set     = 0x60;
+    uint8_t ch6set     = 0x60;
+    uint8_t ch7set     = 0x60;
+    uint8_t ch8set     = 0x60;
 
     uint8_t bias_sensp = 0x00;
     uint8_t bias_sensn = 0x00;

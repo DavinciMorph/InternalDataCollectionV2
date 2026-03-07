@@ -3,6 +3,7 @@
 #include "ads1299/registers.hpp"
 
 #include <time.h>
+#include <unistd.h>
 
 namespace ads1299 {
 
@@ -25,8 +26,10 @@ bool DRDYPoller::poll(double timeout_sec) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     double deadline = ts.tv_sec + ts.tv_nsec * 1e-9 + timeout_sec;
 
-    // No sleep/yield between polls — engine runs on isolated core 3 with SCHED_FIFO.
-    // Polls at ~5-10 kHz (limited by I2C wire time ~100-200us per read).
+    // Sleep 200us between polls to reduce GPIO bit-bang EMI from I2C.
+    // Tight polling toggled GPIO22/23 at ~100kHz (200k-400k transitions/s),
+    // coupling common-mode noise into high-impedance electrode inputs.
+    // With 200us sleep: polls at ~3-5 kHz, DRDY latency ≤400us (well within 4ms budget).
     for (;;) {
         // Read TCA9534 input register once, check all DRDY bits
         uint8_t val = i2c_.read_byte(addr_, TCA9534_INPUT_PORT);
@@ -40,6 +43,8 @@ bool DRDYPoller::poll(double timeout_sec) {
         if (now >= deadline) {
             return false;
         }
+
+        usleep(200);
     }
 }
 

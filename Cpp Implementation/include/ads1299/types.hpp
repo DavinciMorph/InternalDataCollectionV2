@@ -121,7 +121,7 @@ struct DefaultPortConfigs {
     DefaultPortConfigs() : count(0) {
         struct Entry { int bus; int dev; const char* name; int num_daisy; };
         const Entry defaults[] = {
-            {0, 0, "Port1", 9},
+            {0, 0, "Port1", 8},
             {0, 1, "Port2", 7},
             {3, 0, "Port3", 5},
             {3, 1, "Port4", 4},

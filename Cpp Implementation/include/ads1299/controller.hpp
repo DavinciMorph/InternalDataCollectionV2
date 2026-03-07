@@ -40,6 +40,11 @@ public:
     // Returns true on success. This always succeeds if hardware is present.
     static bool initialize_device(ADS1299Device& dev, const DeviceConfig& config);
 
+    // Simple initialization: write registers once without readback verification.
+    // Avoids the WREG/RREG cycling that can corrupt the ADS1299 data output pipeline
+    // on some boards. Relies on data-level verification (status byte check) instead.
+    static bool initialize_device_simple(ADS1299Device& dev, const DeviceConfig& config);
+
     // Start all conversions with synchronized START, then verify each port.
     // Does NOT retry or recover anything — just reports per-port health.
     // Caller (main.cpp) handles per-port recovery via the tiered strategy.
@@ -59,9 +64,10 @@ public:
 
     // Tier 2 recovery: software RESET + register reconfig + RDATAC->START.
     // ~500ms per attempt. Targets digital core latch failures that Tier 1 cannot clear.
+    // When write_once=true, uses write-once registers (no readback verification).
     // Returns true if port is now producing valid data.
     static bool recover_port_tier2(ADS1299Device& dev, const DeviceConfig& config,
-                                   int verify_samples = 10);
+                                   int verify_samples = 10, bool write_once = false);
 
     // Force all START pins LOW
     static void force_all_start_pins_low(std::vector<ADS1299Device*>& devices);
@@ -93,9 +99,13 @@ private:
     // Returns number of valid samples out of N.
     static int verify_port_data(ADS1299Device& dev, int num_samples);
 
-    // Write all config registers without SDATAC verify loop or ID check.
+    // Write all config registers with readback verification (retry loop).
     // Used by Tier 2 where hardware presence is already confirmed.
     static bool write_registers(ADS1299Device& dev, const DeviceConfig& config);
+
+    // Write all config registers once without readback verification.
+    // Used by simple init and as a fallback when write_and_verify is unreliable.
+    static void write_registers_simple(ADS1299Device& dev, const DeviceConfig& config);
 };
 
 } // namespace ads1299

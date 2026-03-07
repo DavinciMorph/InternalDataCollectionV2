@@ -209,6 +209,81 @@ bool ADS1299Controller::initialize_device(ADS1299Device& dev, const DeviceConfig
     return false;
 }
 
+// --- ADS1299Controller: Simple initialization (write-once, no readback) ---
+// Mirrors the sequence proven to work in spi_minimal_test.cpp:
+// RESET -> SDATAC x10 -> write registers once -> done.
+// Skips all WREG/RREG cycling that corrupts the data output pipeline on some boards.
+
+bool ADS1299Controller::initialize_device_simple(ADS1299Device& dev, const DeviceConfig& config) {
+    std::printf("\nConfiguring %s (simple write-once)...\n", dev.config().port_name);
+
+    int num_devices = dev.config().num_devices;
+
+    // 1. Ensure START is low
+    dev.start_low();
+    sleep_ms(50);
+
+    // 2. STOP + flush to clear any stale state
+    dev.send_command(Cmd::STOP);
+    sleep_ms(10);
+    dev.flush_spi();
+    sleep_ms(5);
+
+    // 3. Software RESET
+    dev.send_command(Cmd::RESET);
+    double reset_time = 200.0 + (num_devices * 10.0);
+    sleep_ms(reset_time);
+
+    // 4. SDATAC x10 to ensure all devices in chain exit continuous read mode
+    for (int i = 0; i < 10; ++i) {
+        dev.send_command(Cmd::SDATAC);
+        sleep_ms(20);
+    }
+    sleep_ms(100);
+
+    // 5. Read device ID (informational only -- don't fail on mismatch)
+    uint8_t id_value = dev.read_register(Reg::ID);
+    std::printf("  Device ID: 0x%02X%s\n", id_value,
+                id_value == ADS1299_DEVICE_ID ? " [OK]" : " [WARN: unexpected]");
+
+    // 6. Write all registers once without readback
+    std::printf("  Writing configuration (no verify)...\n");
+    write_registers_simple(dev, config);
+
+    std::printf("  [OK] %s configured (write-once)\n", dev.config().port_name);
+    return true;
+}
+
+// --- ADS1299Controller: Write registers without verification ---
+
+void ADS1299Controller::write_registers_simple(ADS1299Device& dev, const DeviceConfig& config) {
+    // CONFIG3 first -- enables internal reference
+    dev.write_register(Reg::CONFIG3, config.config3);
+    sleep_ms(200);  // Reference buffer settling
+
+    // CONFIG1 -- sample rate and daisy settings
+    dev.write_register(Reg::CONFIG1, config.config1);
+    sleep_ms(10);
+
+    // CONFIG2 -- test signal settings
+    dev.write_register(Reg::CONFIG2, config.config2);
+    sleep_ms(10);
+
+    // Channel settings
+    auto ch_settings = config.get_channel_settings();
+    for (int i = 0; i < 8; ++i) {
+        Reg reg = static_cast<Reg>(static_cast<uint8_t>(Reg::CH1SET) + i);
+        dev.write_register(reg, ch_settings[i]);
+        sleep_ms(10);
+    }
+
+    // MISC1 and CONFIG4
+    dev.write_register(Reg::MISC1, config.misc1);
+    sleep_ms(10);
+    dev.write_register(Reg::CONFIG4, config.config4);
+    sleep_ms(10);
+}
+
 // --- ADS1299Controller: Port data verification ---
 // Reads num_samples from a single port, returns count of valid samples
 // (where ALL devices in the daisy chain have status byte high nibble == 0xC0).
@@ -257,30 +332,37 @@ void ADS1299Controller::start_and_verify(
     // 1. Stop everything cleanly
     std::printf("  Stopping any ongoing conversions...\n");
     force_all_start_pins_low(devices);
+    sleep_ms(20);
     broadcast_command(devices, static_cast<uint8_t>(Cmd::STOP), 10);
 
     if (!running) return;
 
-    // 2. Ensure SDATAC on all devices
+    // 2. Ensure SDATAC on all devices — send multiple times per port
+    //    to handle unreliable SPI links (daisy chains may miss single commands)
     std::printf("  Ensuring all devices in SDATAC mode...\n");
-    broadcast_command(devices, static_cast<uint8_t>(Cmd::SDATAC), 50);
+    for (int rep = 0; rep < 10; ++rep) {
+        broadcast_command(devices, static_cast<uint8_t>(Cmd::SDATAC), 20);
+    }
+    sleep_ms(100);
 
     if (!running) return;
 
-    // 3. Flush all SPI shift registers
-    for (auto* dev : devices) {
-        dev->flush_spi();
+    // 3. Flush all SPI shift registers (multiple times for reliability)
+    for (int rep = 0; rep < 3; ++rep) {
+        for (auto* dev : devices) {
+            dev->flush_spi();
+        }
+        sleep_ms(5);
     }
     sleep_ms(10);
 
-    // 4. Send RDATAC to all devices (fast sequential, twice for reliability)
+    // 4. Send RDATAC to all devices (multiple times for reliability)
     std::printf("  Sending RDATAC to all devices...\n");
-    for (auto* dev : devices) {
-        dev->send_command(Cmd::RDATAC);
-    }
-    sleep_ms(50);
-    for (auto* dev : devices) {
-        dev->send_command(Cmd::RDATAC);
+    for (int rep = 0; rep < 3; ++rep) {
+        for (auto* dev : devices) {
+            dev->send_command(Cmd::RDATAC);
+        }
+        sleep_ms(20);
     }
     sleep_ms(100);
 
@@ -349,18 +431,24 @@ bool ADS1299Controller::recover_port_tier1(ADS1299Device& dev, int verify_sample
     dev.send_command(Cmd::STOP);
     sleep_ms(10);
 
-    // 3. Exit RDATAC
-    dev.send_command(Cmd::SDATAC);
-    sleep_ms(20);
+    // 3. Exit RDATAC — send multiple times for unreliable SPI links
+    for (int i = 0; i < 10; ++i) {
+        dev.send_command(Cmd::SDATAC);
+        sleep_ms(10);
+    }
+    sleep_ms(50);
 
-    // 4. Flush SPI shift register (clears stale data)
-    dev.flush_spi();
-    sleep_ms(5);
+    // 4. Flush SPI shift register (multiple times)
+    for (int i = 0; i < 3; ++i) {
+        dev.flush_spi();
+        sleep_ms(5);
+    }
 
-    // 5. Re-enter RDATAC (send twice for reliability across daisy chain)
-    dev.send_command(Cmd::RDATAC);
-    sleep_ms(10);
-    dev.send_command(Cmd::RDATAC);
+    // 5. Re-enter RDATAC (send multiple times for reliability across daisy chain)
+    for (int i = 0; i < 3; ++i) {
+        dev.send_command(Cmd::RDATAC);
+        sleep_ms(10);
+    }
     sleep_ms(20);
 
     // 6. Assert START
@@ -411,7 +499,7 @@ bool ADS1299Controller::write_registers(ADS1299Device& dev, const DeviceConfig& 
 // ADS1299 datasheet §9.4.1: after RESET, device needs 18 tCLK before ready.
 
 bool ADS1299Controller::recover_port_tier2(ADS1299Device& dev, const DeviceConfig& config,
-                                            int verify_samples) {
+                                            int verify_samples, bool write_once) {
     // 1. Clean slate: de-assert START, stop conversions, exit data mode
     dev.start_low();
     sleep_ms(20);
@@ -437,19 +525,28 @@ bool ADS1299Controller::recover_port_tier2(ADS1299Device& dev, const DeviceConfi
     }
     sleep_ms(30);
 
-    // 5. Rewrite all registers (fast path — no SDATAC verify loop, no ID check)
-    if (!write_registers(dev, config)) {
-        std::printf("    %s: Tier 2 register rewrite failed\n",
-                    dev.config().port_name);
-        return false;
+    // 5. Rewrite all registers
+    if (write_once) {
+        // Write-once: no readback verification (avoids WREG/RREG cycling corruption)
+        write_registers_simple(dev, config);
+    } else {
+        // Verified writes with retry loop
+        if (!write_registers(dev, config)) {
+            std::printf("    %s: Tier 2 register rewrite failed\n",
+                        dev.config().port_name);
+            return false;
+        }
     }
 
-    // 6. Flush + re-enter RDATAC
-    dev.flush_spi();
-    sleep_ms(5);
-    dev.send_command(Cmd::RDATAC);
-    sleep_ms(10);
-    dev.send_command(Cmd::RDATAC);
+    // 6. Flush (multiple times) + re-enter RDATAC (multiple times)
+    for (int i = 0; i < 3; ++i) {
+        dev.flush_spi();
+        sleep_ms(5);
+    }
+    for (int i = 0; i < 3; ++i) {
+        dev.send_command(Cmd::RDATAC);
+        sleep_ms(10);
+    }
     sleep_ms(30);
 
     // 7. Assert START

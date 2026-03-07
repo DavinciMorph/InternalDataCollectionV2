@@ -48,6 +48,10 @@ struct Args {
     char host[64] = "0.0.0.0";
     int port = 8888;
     int min_ports = -1;     // -1 = require all ports (7/7 gate)
+    int config3 = -1;       // -1 = use default (0xE0); override with --config3 0x60
+    int chnset = -1;        // -1 = use default (0x60); override with --chnset 0x61
+    int sps = -1;           // -1 = use default (250); override with --sps 500
+    bool test_signal = false; // --test-signal: CONFIG2=0xD0, CHnSET=0x65
 };
 
 static bool parse_port(const char* str, ads1299::PortConfig& out) {
@@ -107,10 +111,20 @@ static Args parse_args(int argc, char* argv[]) {
             std::strncpy(args.host, argv[++i], sizeof(args.host) - 1);
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             args.port = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
+        } else if (std::strcmp(argv[i], "--config3") == 0 && i + 1 < argc) {
+            args.config3 = static_cast<int>(std::strtol(argv[++i], nullptr, 0));
+        } else if (std::strcmp(argv[i], "--chnset") == 0 && i + 1 < argc) {
+            args.chnset = static_cast<int>(std::strtol(argv[++i], nullptr, 0));
+        } else if (std::strcmp(argv[i], "--sps") == 0 && i + 1 < argc) {
+            args.sps = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
+        } else if (std::strcmp(argv[i], "--test-signal") == 0) {
+            args.test_signal = true;
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             std::printf("Usage: %s [--ports bus,dev,name,num_daisy ...] "
                         "[--full-csv] [--no-csv] [--duration SEC] "
-                        "[--host ADDR] [--port PORT] [--min-ports N]\n\n"
+                        "[--host ADDR] [--port PORT] [--min-ports N]\n"
+                        "       [--config3 0xHH] [--chnset 0xHH] [--sps RATE] "
+                        "[--test-signal]\n\n"
                         "Default: 7 ports x 41 devices = 328 channels @ 250 Hz\n"
                         "         TCP streaming on 0.0.0.0:8888\n"
                         "         CSV disabled (use --full-csv to enable server-side CSV)\n"
@@ -120,8 +134,17 @@ static Args parse_args(int argc, char* argv[]) {
                         "  device: SPI device (0-1)\n"
                         "  name: Port name (e.g. Port1)\n"
                         "  num_daisy: Number of daisy-chained ADS1299s\n\n"
-                        "  --min-ports N: minimum required ports (default: all)\n"
-                        "                 Use to allow degraded operation for testing\n", argv[0]);
+                        "  --min-ports N:  minimum required ports (default: all)\n"
+                        "                  Use to allow degraded operation for testing\n"
+                        "  --config3 0xHH: override CONFIG3 register (default: 0xE0)\n"
+                        "                  0xE0 = internal ref, 0x60 = external ref\n"
+                        "  --chnset 0xHH:  override all CHnSET registers (default: 0x60)\n"
+                        "                  0x60 = normal input gain=24, 0x61 = shorted input\n"
+                        "  --sps RATE:     sample rate (default: 250)\n"
+                        "                  250, 500, 1000, 2000, 4000, 8000, 16000\n"
+                        "  --test-signal:  enable internal test signal\n"
+                        "                  sets CONFIG2=0xD0, CHnSET=0x05 (gain=1, test mux)\n",
+                        argv[0]);
             std::exit(0);
         }
     }
@@ -325,12 +348,13 @@ int main(int argc, char* argv[]) {
     }
     int total_channels = total_devices * ads1299::CHANNELS_PER_DEVICE;
 
+    int display_sps = args.sps > 0 ? args.sps : 250;
     std::printf("\n============================================================\n"
                 "ADS1299 C++ ACQUISITION ENGINE (Phase 2: TCP Streaming)\n"
                 "============================================================\n"
-                "Config: %d ports, %d devices, %d channels @ 250Hz\n"
+                "Config: %d ports, %d devices, %d channels @ %dHz\n"
                 "Stream: %s:%d\n\n",
-                args.num_ports, total_devices, total_channels,
+                args.num_ports, total_devices, total_channels, display_sps,
                 args.host, args.port);
 
     // --- Signal handling ---
@@ -413,6 +437,57 @@ int main(int argc, char* argv[]) {
 
     ads1299::DeviceConfig config;
 
+    // Apply CLI overrides (test-signal first so --config3/--chnset can still override)
+    if (args.test_signal) {
+        config.config2 = 0xD0;  // Internal test signal, 1x amplitude, slow pulse
+        config.ch1set = 0x05;   // Gain=1, MUX=test signal
+        config.ch2set = 0x05;
+        config.ch3set = 0x05;
+        config.ch4set = 0x05;
+        config.ch5set = 0x05;
+        config.ch6set = 0x05;
+        config.ch7set = 0x05;
+        config.ch8set = 0x05;
+        std::printf("  Test signal enabled: CONFIG2=0xD0, CHnSET=0x05 (gain=1, test mux)\n");
+    }
+    if (args.sps > 0) {
+        // CONFIG1[2:0] = DR bits. Upper bits preserved (0x96 = daisy + 250 SPS).
+        // DR: 000=16k, 001=8k, 010=4k, 011=2k, 100=1k, 101=500, 110=250
+        uint8_t dr_bits;
+        switch (args.sps) {
+            case 250:   dr_bits = 0x06; break;
+            case 500:   dr_bits = 0x05; break;
+            case 1000:  dr_bits = 0x04; break;
+            case 2000:  dr_bits = 0x03; break;
+            case 4000:  dr_bits = 0x02; break;
+            case 8000:  dr_bits = 0x01; break;
+            case 16000: dr_bits = 0x00; break;
+            default:
+                std::fprintf(stderr, "Error: Invalid --sps %d. "
+                             "Valid: 250, 500, 1000, 2000, 4000, 8000, 16000\n",
+                             args.sps);
+                return 1;
+        }
+        config.config1 = (config.config1 & 0xF8) | dr_bits;
+        std::printf("  Sample rate override: %d SPS (CONFIG1=0x%02X)\n",
+                    args.sps, config.config1);
+    }
+    if (args.config3 >= 0) {
+        config.config3 = static_cast<uint8_t>(args.config3);
+        std::printf("  CONFIG3 override: 0x%02X\n", config.config3);
+    }
+    if (args.chnset >= 0) {
+        uint8_t val = static_cast<uint8_t>(args.chnset);
+        config.ch1set = val;
+        config.ch2set = val;
+        config.ch3set = val;
+        config.ch4set = val;
+        config.ch5set = val;
+        config.ch6set = val;
+        config.ch7set = val;
+        config.ch8set = val;
+        std::printf("  CHnSET override: 0x%02X (all 8 channels)\n", val);
+    }
     for (int i = 0; i < args.num_ports; ++i) {
         if (!g_running) {
             std::printf("\n[CANCELLED] Ctrl+C during configuration\n");
@@ -802,10 +877,15 @@ int main(int argc, char* argv[]) {
         csv_writer->stop();
     }
 
-    // Stop ADS1299 devices
+    // Stop ADS1299 devices — full cleanup to leave hardware in clean state
     for (auto* dev : devices) {
         dev->start_low();
         dev->send_command(ads1299::Cmd::STOP);
+        // SDATAC multiple times to ensure all devices exit RDATAC mode
+        for (int i = 0; i < 10; ++i) {
+            dev->send_command(ads1299::Cmd::SDATAC);
+        }
+        dev->flush_spi();
     }
 
     // Final statistics
