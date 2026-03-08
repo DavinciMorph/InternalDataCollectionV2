@@ -100,7 +100,7 @@ High-impedance electrodes saturating the ADS1299 PGA to near-negative-rail value
 - ISIs are irregular (std >> mean), not periodic
 
 ### Channel-Specific Pattern
-Channel 5 is systematically affected: 52-55% of all ch5 inputs across 40 devices are always railed. This indicates a systematic wiring/connector problem specific to the ch5 electrode position.
+Channel 5 is systematically affected: 52-55% of all ch5 inputs across 42 devices are always railed. This indicates a systematic wiring/connector problem specific to the ch5 electrode position.
 
 ### No Fix Needed
 This is an electrode/connector quality issue, not a firmware or SPI bug. The C++ acquisition engine shows perfect data integrity (zero gaps, zero missed samples, zero SPI corruption).

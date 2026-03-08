@@ -10,7 +10,7 @@
 ### Hardware
 
 - **ADC:** TI ADS1299 (24-bit, 8-channel delta-sigma)
-- **Topology:** 7 SPI ports, 40 devices total in daisy chains, 320 channels @ 250 Hz
+- **Topology:** 7 SPI ports, 42 devices total in daisy chains, 336 channels @ 250 Hz
 - **Platform:** Raspberry Pi CM4 (BCM2711 / Cortex-A72), IP 192.168.1.175
 
 **Port layout:**
@@ -20,8 +20,8 @@
 | Port1 | SPI0 | CS0 | 8 | 64 | Legacy DMA |
 | Port2 | SPI0 | CS1 | 7 | 56 | Legacy DMA |
 | Port3 | SPI3 | CS0 | 5 | 40 | Legacy DMA (DREQs 16/18) |
-| Port4 | SPI3 | CS1 | 4 | 32 | Legacy DMA (DREQs 16/18) |
-| Port5 | SPI4 | CS0 | 4 | 32 | Legacy DMA (DREQs 19/20) |
+| Port4 | SPI3 | CS1 | 5 | 40 | Legacy DMA (DREQs 16/18) |
+| Port5 | SPI4 | CS0 | 5 | 40 | Legacy DMA (DREQs 19/20) |
 | Port6 | SPI4 | CS1 | 5 | 40 | Legacy DMA (DREQs 19/20) |
 | Port7 | SPI5 | CS0 | 7 | 56 | DMA4 (DREQs 21/22) |
 
@@ -67,7 +67,7 @@ From `Cpp Implementation/include/ads1299/registers.hpp` (`DeviceConfig` struct):
 ### CLI Arguments
 
 ```
---ports bus,dev,name,num_daisy ...   Custom port config (default: 7 ports, 40 devices)
+--ports bus,dev,name,num_daisy ...   Custom port config (default: 7 ports, 42 devices)
 --full-csv                           Enable server-side CSV (default: off, client-side)
 --duration SEC                       Auto-stop after SEC seconds
 --min-ports N                        Minimum ports required (default: all = 7/7 gate)
@@ -83,7 +83,7 @@ From `Cpp Implementation/include/ads1299/registers.hpp` (`DeviceConfig` struct):
 
 Raw uncompressed binary over TCP (LZ4 removed -- see Section 4).
 Each sample sent individually (BATCH_SIZE=1).
-Bandwidth: ~227 KB/s at 320 channels @ 250 Hz.
+Bandwidth: ~238 KB/s at 336 channels @ 250 Hz.
 
 Wire format: metadata JSON (once per connection) + repeated `[u32 payload_size][u32 sample_count=1][raw sample data]`.
 Metadata: `"format":"binary_raw","compression":"none"`.

@@ -124,8 +124,8 @@ struct DefaultPortConfigs {
             {0, 0, "Port1", 8},
             {0, 1, "Port2", 7},
             {3, 0, "Port3", 5},
-            {3, 1, "Port4", 4},
-            {4, 0, "Port5", 4},
+            {3, 1, "Port4", 5},
+            {4, 0, "Port5", 5},
             {4, 1, "Port6", 5},
             {5, 0, "Port7", 7},
         };

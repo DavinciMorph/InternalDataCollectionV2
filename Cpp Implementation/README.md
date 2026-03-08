@@ -1,8 +1,8 @@
 # ADS1299 C++ Acquisition Engine
 
-Real-time 224-channel EEG acquisition engine for Raspberry Pi 4, with simultaneous CSV recording and live TCP streaming to the PyQt5 visualizer.
+Real-time 336-channel EEG acquisition engine for Raspberry Pi 4, with simultaneous CSV recording and live TCP streaming to the PyQt5 visualizer.
 
-**Hardware:** 7 SPI ports, 4 daisy-chained ADS1299 per port, 28 devices, 224 channels @ 250 Hz.
+**Hardware:** 7 SPI ports, 42 ADS1299 devices in daisy chains (5-8 per port), 336 channels @ 250 Hz.
 
 ## Prerequisites
 

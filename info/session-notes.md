@@ -113,7 +113,7 @@ See `testing/electrode-testing.md` for full results.
 
 ## 2026-03-04: Signal Quality Analysis
 
-Gain comparison (8x/12x/24x) and cold-start analysis on 320 channels:
+Gain comparison (8x/12x/24x) and cold-start analysis on 336 channels:
 - 12x optimal for channel yield (66.6% usable)
 - 24x viable with good connectors after 5-10 min settling (76% usable)
 - Wiring/connector quality is THE dominant variable for channel yield

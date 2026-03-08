@@ -54,7 +54,7 @@ Signal quality analysis across the 320-channel system. Covers gain comparison, c
 | Railed channels | 43 (19.2%) | 60 (26.8%) |
 | Artifact channels | 100 (44.6%) | 6 (2.7%) |
 
-### 320-Channel Results (all 40 devices)
+### 336-Channel Results (all 42 devices)
 
 | Metric | First Segment | Last Segment (Settled) |
 |--------|--------------|------------------------|
