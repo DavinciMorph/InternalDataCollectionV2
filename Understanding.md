@@ -268,14 +268,9 @@ A/B testing showed minimal effect with the current electrode geometry (8 distrib
 
 ## 7. Known Issues / Open Items
 
-1. **Daisy-chain register readback:** `write_and_verify()` only reads back device 1 per port. Devices 2+ receive commands (shared MOSI) but register state is never verified. A power-glitch bit-flip on a deep device is invisible to init.
-2. **Health check validates status bytes only:** The 0xC0 status nibble check misses devices with valid status but garbage channel data. Channel-level validation not implemented.
-3. **Port5 connector defect:** Needs hardware inspection/replacement.
-4. **47-49 railed channels:** Hardware/connector issue, not software.
-5. **TCA9534 INT pin floating:** Prevents interrupt-driven DRDY; polling required.
-6. **Residual ~70 Hz artifact:** Reduced 4x by GPU disable but not eliminated.
-7. **WiFi 2.4 GHz congestion:** 21 visible networks on channel 11. Long runs may see client disconnects. Consider 5 GHz or wired Ethernet.
-8. **Electrode impedance drift:** Dry electrodes cause RMS growth and filter artifacts in long recordings. Use gel + skin prep for stable recordings.
+1. **Health check validates status bytes only:** The 0xC0 status nibble check misses devices with valid status but garbage channel data. Channel-level validation not implemented.
+2. **TCA9534 INT pin floating:** Prevents interrupt-driven DRDY; polling required.
+3. **Residual ~70 Hz artifact:** Reduced 4x by GPU disable but not eliminated (~2.7 uV^2/Hz on cleanest channels, essentially at noise floor).
 
 ---
 
