@@ -115,12 +115,11 @@ class CSVViewer(QtWidgets.QMainWindow):
             self.sel_ch = self.hierarchy['port_dev_chs'][(self.sel_port, self.sel_dev)][0]
         self.selected_channel = 0
 
-        # Pre-compute 60 Hz notch-filtered signals for all channels
-        notch_b, notch_a = sig.iirnotch(60.0, Q=30.0, fs=self.sps)
-        self.filtered_data = np.zeros_like(self.channel_data)
-        for i in range(self.num_channels):
-            self.filtered_data[:, i] = sig.filtfilt(notch_b, notch_a, self.channel_data[:, i])
+        # Filter state (applied on-the-fly per selected channel)
         self.notch_on = False
+        self.hpf_on = False
+        self.lpf_on = False
+        self._filter_cache = None  # (channel_idx, notch, hpf, lpf, data)
 
         self.setWindowTitle(f'CSV Viewer — {os.path.basename(filepath)}')
         self.setGeometry(100, 100, 1200, 800)
@@ -134,6 +133,20 @@ class CSVViewer(QtWidgets.QMainWindow):
         self.status = QtWidgets.QLabel()
         top_bar.addWidget(self.status)
         top_bar.addStretch()
+        self.hpf_btn = QtWidgets.QPushButton('1Hz HPF: OFF')
+        self.hpf_btn.setCheckable(True)
+        self.hpf_btn.setChecked(False)
+        self.hpf_btn.setStyleSheet('background-color: #2a2a2a; color: #aaaaaa; padding: 4px 12px;')
+        self.hpf_btn.clicked.connect(self.toggle_hpf)
+        top_bar.addWidget(self.hpf_btn)
+
+        self.lpf_btn = QtWidgets.QPushButton('50Hz LPF: OFF')
+        self.lpf_btn.setCheckable(True)
+        self.lpf_btn.setChecked(False)
+        self.lpf_btn.setStyleSheet('background-color: #2a2a2a; color: #aaaaaa; padding: 4px 12px;')
+        self.lpf_btn.clicked.connect(self.toggle_lpf)
+        top_bar.addWidget(self.lpf_btn)
+
         self.notch_btn = QtWidgets.QPushButton('60Hz Notch: OFF')
         self.notch_btn.setCheckable(True)
         self.notch_btn.setChecked(False)
@@ -148,14 +161,32 @@ class CSVViewer(QtWidgets.QMainWindow):
         else:
             self._build_flat_selector(layout)
 
-        # Single plot
+        # Plots in a vertical splitter (time-domain + PSD)
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self.plot_widget.setClipToView(True)
         self.plot_widget.setDownsampling(mode='peak')
         self.curve = self.plot_widget.plot(
             pen=pg.mkPen(color=self._current_color(), width=2))
-        layout.addWidget(self.plot_widget)
+        self.splitter.addWidget(self.plot_widget)
+
+        # PSD plot (hidden until generated)
+        self.psd_widget = pg.PlotWidget()
+        self.psd_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.psd_widget.setLabel('left', 'Power (µV²/Hz)')
+        self.psd_widget.setLabel('bottom', 'Frequency (Hz)')
+        self.psd_widget.setLogMode(x=False, y=True)
+        self.psd_60hz_line = pg.InfiniteLine(
+            pos=60, angle=90, pen=pg.mkPen('r', width=1, style=QtCore.Qt.DashLine))
+        self.psd_widget.addItem(self.psd_60hz_line)
+        self.psd_curve = self.psd_widget.plot(
+            pen=pg.mkPen(color=self._current_color(), width=2))
+        self.psd_widget.hide()
+        self.splitter.addWidget(self.psd_widget)
+
+        layout.addWidget(self.splitter)
 
         # Bottom controls
         bottom = QtWidgets.QHBoxLayout()
@@ -177,6 +208,55 @@ class CSVViewer(QtWidgets.QMainWindow):
         bottom.addWidget(self.window_spin)
 
         layout.addLayout(bottom)
+
+        # PSD controls row
+        psd_bar = QtWidgets.QHBoxLayout()
+        psd_bar.addWidget(QtWidgets.QLabel('PSD:'))
+
+        psd_bar.addWidget(QtWidgets.QLabel('Start'))
+        self.start_spin = QtWidgets.QDoubleSpinBox()
+        self.start_spin.setRange(0.0, self.timestamps[-1])
+        self.start_spin.setValue(0.0)
+        self.start_spin.setSuffix(' s')
+        self.start_spin.setSingleStep(1.0)
+        self.start_spin.setDecimals(2)
+        psd_bar.addWidget(self.start_spin)
+
+        psd_bar.addWidget(QtWidgets.QLabel('End'))
+        self.end_spin = QtWidgets.QDoubleSpinBox()
+        self.end_spin.setRange(0.0, self.timestamps[-1])
+        self.end_spin.setValue(self.timestamps[-1])
+        self.end_spin.setSuffix(' s')
+        self.end_spin.setSingleStep(1.0)
+        self.end_spin.setDecimals(2)
+        psd_bar.addWidget(self.end_spin)
+
+        self.psd_btn = QtWidgets.QPushButton('Generate PSD')
+        self.psd_btn.setStyleSheet('background-color: #6a1b9a; color: white; padding: 4px 12px;')
+        self.psd_btn.clicked.connect(self.generate_psd)
+        psd_bar.addWidget(self.psd_btn)
+
+        self.export_btn = QtWidgets.QPushButton('Export')
+        self.export_btn.setStyleSheet('background-color: #1565c0; color: white; padding: 4px 12px;')
+        self.export_btn.clicked.connect(self.export_psd)
+        psd_bar.addWidget(self.export_btn)
+
+        psd_bar.addStretch()
+
+        psd_bar.addWidget(QtWidgets.QLabel('Y-axis:'))
+        self.yaxis_spin = QtWidgets.QDoubleSpinBox()
+        self.yaxis_spin.setRange(0, 1e9)
+        self.yaxis_spin.setValue(0)
+        self.yaxis_spin.setDecimals(0)
+        self.yaxis_spin.setSpecialValueText('Auto')
+        self.yaxis_spin.setSingleStep(100)
+        self.yaxis_spin.valueChanged.connect(self.update_plot)
+        psd_bar.addWidget(self.yaxis_spin)
+
+        layout.addLayout(psd_bar)
+
+        # Store last PSD data for export
+        self._last_psd = None  # (t_start, t_end, channel_name, timestamps, segment_uv, freqs, psd)
 
         self.update_plot()
 
@@ -229,10 +309,26 @@ class CSVViewer(QtWidgets.QMainWindow):
 
     def _pick_port(self, name):
         self.sel_port = name
+        h = self.hierarchy
+        available_devs = h['port_devs'].get(self.sel_port, [])
+        # If current device not available under new port, select the first one
+        if self.sel_dev not in available_devs:
+            self.sel_dev = available_devs[0] if available_devs else self.sel_dev
+        # Cascade: ensure channel is valid for new port+device
+        available_chs = h['port_dev_chs'].get((self.sel_port, self.sel_dev), [])
+        if self.sel_ch not in available_chs:
+            self.sel_ch = available_chs[0] if available_chs else self.sel_ch
+        self._update_visible_buttons()
         self._apply_hierarchy_selection()
 
     def _pick_dev(self, name):
         self.sel_dev = name
+        h = self.hierarchy
+        # Ensure channel is valid for new port+device combo
+        available_chs = h['port_dev_chs'].get((self.sel_port, self.sel_dev), [])
+        if self.sel_ch not in available_chs:
+            self.sel_ch = available_chs[0] if available_chs else self.sel_ch
+        self._update_visible_buttons()
         self._apply_hierarchy_selection()
 
     def _pick_ch(self, name):
@@ -247,6 +343,17 @@ class CSVViewer(QtWidgets.QMainWindow):
         self.curve.setPen(pg.mkPen(color=self._current_color(), width=2))
         self.plot_widget.setLabel('left', self._current_name())
         self.update_plot()
+
+    def _update_visible_buttons(self):
+        """Show only the device buttons valid for the selected port,
+        and only the channel buttons valid for the selected port+device."""
+        h = self.hierarchy
+        visible_devs = set(h['port_devs'].get(self.sel_port, []))
+        visible_chs = set(h['port_dev_chs'].get((self.sel_port, self.sel_dev), []))
+        for name, btn in self.dev_btns.items():
+            btn.setVisible(name in visible_devs)
+        for name, btn in self.ch_btns.items():
+            btn.setVisible(name in visible_chs)
 
     def _style_hierarchy_buttons(self):
         color = PORT_COLORS.get(self.sel_port, '#2196F3')
@@ -311,20 +418,50 @@ class CSVViewer(QtWidgets.QMainWindow):
         self.slider.setMaximum(max(0, self.total - self.window_size))
         self.update_plot()
 
+    def _get_filtered_data(self):
+        """Return filtered data for the selected channel, using cache."""
+        cache_key = (self.selected_channel, self.notch_on, self.hpf_on, self.lpf_on)
+        if self._filter_cache is not None and self._filter_cache[0] == cache_key:
+            return self._filter_cache[1]
+
+        data = self.channel_data[:, self.selected_channel].copy()
+        data = data / 24.0  # remove 24x PGA gain
+
+        if self.hpf_on:
+            hpf_sos = sig.butter(10, 1.0, btype='high', fs=self.sps, output='sos')
+            data = sig.sosfiltfilt(hpf_sos, data)
+
+        if self.lpf_on:
+            lpf_sos = sig.butter(10, 50.0, btype='low', fs=self.sps, output='sos')
+            data = sig.sosfiltfilt(lpf_sos, data)
+
+        if self.notch_on:
+            notch_b, notch_a = sig.iirnotch(60.0, Q=30.0, fs=self.sps)
+            data = sig.filtfilt(notch_b, notch_a, data)
+
+        self._filter_cache = (cache_key, data)
+        return data
+
     def update_plot(self):
         start = self.slider.value()
         end = min(start + self.window_size, self.total)
 
         t = self.timestamps[start:end]
-        source = self.filtered_data if self.notch_on else self.channel_data
-        v = source[start:end, self.selected_channel]
+        v = self._get_filtered_data()[start:end]
 
         self.curve.setData(t, v)
         self.plot_widget.setXRange(t[0], t[-1], padding=0)
 
-        y_min, y_max = v.min(), v.max()
-        margin = max((y_max - y_min) * 0.1, 1000)
-        self.plot_widget.setYRange(y_min - margin, y_max + margin, padding=0)
+        y_lock = self.yaxis_spin.value()
+        if y_lock > 0:
+            y_center = float(v.mean())
+            y_min, y_max = y_center - y_lock, y_center + y_lock
+            self.plot_widget.setYRange(y_min, y_max, padding=0)
+        else:
+            y_min, y_max = float(v.min()), float(v.max())
+            margin = max((y_max - y_min) * 0.1, 1000)
+            y_min, y_max = y_min - margin, y_max + margin
+            self.plot_widget.setYRange(y_min, y_max, padding=0)
 
         self.status.setText(
             f'{self._current_name()}  |  '
@@ -334,20 +471,106 @@ class CSVViewer(QtWidgets.QMainWindow):
             f'range [{y_min:.0f}, {y_max:.0f}]'
         )
 
-    def toggle_notch(self):
-        self.notch_on = not self.notch_on
+    def generate_psd(self):
+        LSB_UV = 4.5 / (8388608 * 24) * 1e6  # raw ADC to µV
+
+        t_start = self.start_spin.value()
+        t_end = self.end_spin.value()
+        if t_end <= t_start:
+            return
+
+        i_start = int(np.searchsorted(self.timestamps, t_start))
+        i_end = int(np.searchsorted(self.timestamps, t_end))
+        if i_end - i_start < 4:
+            return
+
+        segment = self.channel_data[i_start:i_end, self.selected_channel].copy()
+        segment = segment * LSB_UV  # convert to µV
+        segment -= segment.mean()  # remove DC
+
+        # Apply active filters
+        if self.hpf_on:
+            hpf_sos = sig.butter(10, 1.0, btype='high', fs=self.sps, output='sos')
+            segment = sig.sosfiltfilt(hpf_sos, segment)
+
+        if self.lpf_on:
+            lpf_sos = sig.butter(10, 50.0, btype='low', fs=self.sps, output='sos')
+            segment = sig.sosfiltfilt(lpf_sos, segment)
+
         if self.notch_on:
-            self.notch_btn.setText('60Hz Notch: ON')
-            self.notch_btn.setStyleSheet('background-color: #00aa55; color: white; padding: 4px 12px;')
-        else:
-            self.notch_btn.setText('60Hz Notch: OFF')
-            self.notch_btn.setStyleSheet('background-color: #2a2a2a; color: #aaaaaa; padding: 4px 12px;')
+            notch_b, notch_a = sig.iirnotch(60.0, Q=30.0, fs=self.sps)
+            segment = sig.filtfilt(notch_b, notch_a, segment)
+
+        nperseg = min(1024, len(segment))
+        freqs, psd = sig.welch(segment, fs=self.sps, nperseg=nperseg,
+                               window='hann', noverlap=nperseg // 2)
+
+        # Filter out DC bin (freq=0) since log(0) is undefined
+        mask = freqs > 0
+        freqs = freqs[mask]
+        psd = psd[mask]
+
+        # Store segment timestamps and µV data for export
+        seg_timestamps = self.timestamps[i_start:i_end]
+        self._last_psd = (t_start, t_end, self._current_name(),
+                          seg_timestamps, segment, freqs, psd)
+
+        self.psd_curve.setData(freqs, psd)
+        self.psd_curve.setPen(pg.mkPen(color=self._current_color(), width=2))
+        self.psd_widget.setTitle(
+            f'PSD: {self._current_name()} [{t_start:.1f}s – {t_end:.1f}s]')
+        self.psd_widget.show()
+
+    def export_psd(self):
+        if self._last_psd is None:
+            return
+        t_start, t_end, ch_name, seg_ts, seg_uv, freqs, psd = self._last_psd
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, 'Export PSD Data', f'psd_{ch_name}_{t_start:.0f}s-{t_end:.0f}s.csv',
+            'CSV Files (*.csv)')
+        if not path:
+            return
+
+        with open(path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            # Time-domain segment
+            writer.writerow(['Time-domain segment'])
+            writer.writerow(['timestamp_s', f'{ch_name}_uV'])
+            for t, v in zip(seg_ts, seg_uv):
+                writer.writerow([f'{t:.6f}', f'{v:.6f}'])
+            writer.writerow([])
+            # PSD
+            writer.writerow(['PSD (Welch)'])
+            writer.writerow(['frequency_Hz', 'power_uV2_per_Hz'])
+            for freq, power in zip(freqs, psd):
+                writer.writerow([f'{freq:.4f}', f'{power:.6e}'])
+
+    def _toggle_filter(self, attr, btn, on_label, off_label):
+        setattr(self, attr, not getattr(self, attr))
+        on = getattr(self, attr)
+        btn.setText(on_label if on else off_label)
+        btn.setStyleSheet(
+            'background-color: #00aa55; color: white; padding: 4px 12px;' if on
+            else 'background-color: #2a2a2a; color: #aaaaaa; padding: 4px 12px;')
+        self._filter_cache = None
         self.update_plot()
+
+    def toggle_hpf(self):
+        self._toggle_filter('hpf_on', self.hpf_btn, '1Hz HPF: ON', '1Hz HPF: OFF')
+
+    def toggle_lpf(self):
+        self._toggle_filter('lpf_on', self.lpf_btn, '50Hz LPF: ON', '50Hz LPF: OFF')
+
+    def toggle_notch(self):
+        self._toggle_filter('notch_on', self.notch_btn, '60Hz Notch: ON', '60Hz Notch: OFF')
 
     def keyPressEvent(self, event):
         step = max(1, self.window_size // 4)
         key = event.key()
-        if key == QtCore.Qt.Key_N:
+        if key == QtCore.Qt.Key_P:
+            self.generate_psd()
+        elif key == QtCore.Qt.Key_N:
             self.toggle_notch()
         elif key == QtCore.Qt.Key_Right:
             self.slider.setValue(min(self.slider.value() + step, self.slider.maximum()))

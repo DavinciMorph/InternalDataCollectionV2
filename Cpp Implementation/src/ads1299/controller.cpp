@@ -185,11 +185,19 @@ bool ADS1299Controller::initialize_device(ADS1299Device& dev, const DeviceConfig
         if (!write_and_verify(dev, reg, ch_settings[i], name)) return false;
     }
 
-    // 8. Write MISC1 and CONFIG4
+    // 8. Write BIAS routing registers (non-zero only when BIAS is enabled)
+    if (config.bias_sensp != 0x00 || config.bias_sensn != 0x00) {
+        std::printf("  Writing BIAS routing (SENSP=0x%02X, SENSN=0x%02X)...\n",
+                    config.bias_sensp, config.bias_sensn);
+        if (!write_and_verify(dev, Reg::BIAS_SENSP, config.bias_sensp, "BIAS_SENSP")) return false;
+        if (!write_and_verify(dev, Reg::BIAS_SENSN, config.bias_sensn, "BIAS_SENSN")) return false;
+    }
+
+    // 9. Write MISC1 and CONFIG4
     if (!write_and_verify(dev, Reg::MISC1, config.misc1, "MISC1")) return false;
     if (!write_and_verify(dev, Reg::CONFIG4, config.config4, "CONFIG4")) return false;
 
-    // 9. Final verification - re-verify each CONFIG with retry if needed
+    // 10. Final verification - re-verify each CONFIG with retry if needed
     uint8_t c1_read, c2_read, c3_read;
     bool c1_ok = verify_register(dev, Reg::CONFIG1, config.config1, "CONFIG1", c1_read);
     bool c2_ok = verify_register(dev, Reg::CONFIG2, config.config2, "CONFIG2", c2_read);
@@ -274,6 +282,14 @@ void ADS1299Controller::write_registers_simple(ADS1299Device& dev, const DeviceC
     for (int i = 0; i < 8; ++i) {
         Reg reg = static_cast<Reg>(static_cast<uint8_t>(Reg::CH1SET) + i);
         dev.write_register(reg, ch_settings[i]);
+        sleep_ms(10);
+    }
+
+    // BIAS routing registers (only written when non-zero)
+    if (config.bias_sensp != 0x00 || config.bias_sensn != 0x00) {
+        dev.write_register(Reg::BIAS_SENSP, config.bias_sensp);
+        sleep_ms(10);
+        dev.write_register(Reg::BIAS_SENSN, config.bias_sensn);
         sleep_ms(10);
     }
 
@@ -485,6 +501,12 @@ bool ADS1299Controller::write_registers(ADS1299Device& dev, const DeviceConfig& 
         std::snprintf(name, sizeof(name), "CH%dSET", i + 1);
         Reg reg = static_cast<Reg>(static_cast<uint8_t>(Reg::CH1SET) + i);
         if (!write_and_verify(dev, reg, ch_settings[i], name)) return false;
+    }
+
+    // BIAS routing registers (only written when non-zero)
+    if (config.bias_sensp != 0x00 || config.bias_sensn != 0x00) {
+        if (!write_and_verify(dev, Reg::BIAS_SENSP, config.bias_sensp, "BIAS_SENSP")) return false;
+        if (!write_and_verify(dev, Reg::BIAS_SENSN, config.bias_sensn, "BIAS_SENSN")) return false;
     }
 
     if (!write_and_verify(dev, Reg::MISC1, config.misc1, "MISC1")) return false;

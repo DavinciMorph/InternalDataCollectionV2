@@ -4,4 +4,5 @@ __pycache__/
 .claude/
 data/
 *.csv
+*.img.gz
 nul

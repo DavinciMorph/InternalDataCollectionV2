@@ -52,6 +52,7 @@ struct Args {
     int chnset = -1;        // -1 = use default (0x60); override with --chnset 0x61
     int sps = -1;           // -1 = use default (250); override with --sps 500
     bool test_signal = false; // --test-signal: CONFIG2=0xD0, CHnSET=0x65
+    int bias_port = 0;      // 0 = disabled; 1-7 = enable BIAS drive on that port number
 };
 
 static bool parse_port(const char* str, ads1299::PortConfig& out) {
@@ -119,12 +120,14 @@ static Args parse_args(int argc, char* argv[]) {
             args.sps = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
         } else if (std::strcmp(argv[i], "--test-signal") == 0) {
             args.test_signal = true;
+        } else if (std::strcmp(argv[i], "--bias-port") == 0 && i + 1 < argc) {
+            args.bias_port = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             std::printf("Usage: %s [--ports bus,dev,name,num_daisy ...] "
                         "[--full-csv] [--no-csv] [--duration SEC] "
                         "[--host ADDR] [--port PORT] [--min-ports N]\n"
                         "       [--config3 0xHH] [--chnset 0xHH] [--sps RATE] "
-                        "[--test-signal]\n\n"
+                        "[--test-signal] [--bias-port N]\n\n"
                         "Default: 7 ports x 41 devices = 328 channels @ 250 Hz\n"
                         "         TCP streaming on 0.0.0.0:8888\n"
                         "         CSV disabled (use --full-csv to enable server-side CSV)\n"
@@ -143,7 +146,10 @@ static Args parse_args(int argc, char* argv[]) {
                         "  --sps RATE:     sample rate (default: 250)\n"
                         "                  250, 500, 1000, 2000, 4000, 8000, 16000\n"
                         "  --test-signal:  enable internal test signal\n"
-                        "                  sets CONFIG2=0xD0, CHnSET=0x05 (gain=1, test mux)\n",
+                        "                  sets CONFIG2=0xD0, CHnSET=0x05 (gain=1, test mux)\n"
+                        "  --bias-port N:  enable BIAS drive on port N (1-7, default: disabled)\n"
+                        "                  Channels 1-7 route to bias amp, ch8 drives BIAS out\n"
+                        "                  Sets CONFIG3=0xF0, BIAS_SENSP/N=0x7F, CH8SET=0x06\n",
                         argv[0]);
             std::exit(0);
         }
@@ -173,7 +179,7 @@ static int run_tiered_recovery(
     ads1299::PortHealth* port_health,
     bool* port_dead,
     int num_ports,
-    const ads1299::DeviceConfig& config,
+    const ads1299::DeviceConfig* port_configs,
     const volatile sig_atomic_t& running)
 {
     auto count_healthy = [&]() {
@@ -238,7 +244,7 @@ static int run_tiered_recovery(
         for (int a = 0; a < TIER2_ATTEMPTS && running; ++a) {
             std::printf("    %s: Tier 2 attempt %d/%d...\n",
                         dev->config().port_name, a + 1, TIER2_ATTEMPTS);
-            if (ads1299::ADS1299Controller::recover_port_tier2(*dev, config, 10)) {
+            if (ads1299::ADS1299Controller::recover_port_tier2(*dev, port_configs[p], 10)) {
                 std::printf("    %s: Tier 2 recovered on attempt %d [OK]\n",
                             dev->config().port_name, a + 1);
                 port_health[p].healthy = true;
@@ -275,7 +281,7 @@ static int run_tiered_recovery(
         // Re-configure all ports (Phase 1 redo)
         bool all_configured = true;
         for (int p = 0; p < num_ports && running; ++p) {
-            bool ok = ads1299::ADS1299Controller::initialize_device(*devices[p], config);
+            bool ok = ads1299::ADS1299Controller::initialize_device(*devices[p], port_configs[p]);
             if (!ok) {
                 std::printf("    %s: register re-init failed\n",
                             devices[p]->config().port_name);
@@ -435,19 +441,20 @@ int main(int argc, char* argv[]) {
                 "PHASE 1: CONFIGURING DEVICES (registers)\n"
                 "============================================================\n");
 
-    ads1299::DeviceConfig config;
+    // Build base config (shared by all ports)
+    ads1299::DeviceConfig base_config;
 
     // Apply CLI overrides (test-signal first so --config3/--chnset can still override)
     if (args.test_signal) {
-        config.config2 = 0xD0;  // Internal test signal, 1x amplitude, slow pulse
-        config.ch1set = 0x05;   // Gain=1, MUX=test signal
-        config.ch2set = 0x05;
-        config.ch3set = 0x05;
-        config.ch4set = 0x05;
-        config.ch5set = 0x05;
-        config.ch6set = 0x05;
-        config.ch7set = 0x05;
-        config.ch8set = 0x05;
+        base_config.config2 = 0xD0;  // Internal test signal, 1x amplitude, slow pulse
+        base_config.ch1set = 0x05;   // Gain=1, MUX=test signal
+        base_config.ch2set = 0x05;
+        base_config.ch3set = 0x05;
+        base_config.ch4set = 0x05;
+        base_config.ch5set = 0x05;
+        base_config.ch6set = 0x05;
+        base_config.ch7set = 0x05;
+        base_config.ch8set = 0x05;
         std::printf("  Test signal enabled: CONFIG2=0xD0, CHnSET=0x05 (gain=1, test mux)\n");
     }
     if (args.sps > 0) {
@@ -468,32 +475,76 @@ int main(int argc, char* argv[]) {
                              args.sps);
                 return 1;
         }
-        config.config1 = (config.config1 & 0xF8) | dr_bits;
+        base_config.config1 = (base_config.config1 & 0xF8) | dr_bits;
         std::printf("  Sample rate override: %d SPS (CONFIG1=0x%02X)\n",
-                    args.sps, config.config1);
+                    args.sps, base_config.config1);
     }
     if (args.config3 >= 0) {
-        config.config3 = static_cast<uint8_t>(args.config3);
-        std::printf("  CONFIG3 override: 0x%02X\n", config.config3);
+        base_config.config3 = static_cast<uint8_t>(args.config3);
+        std::printf("  CONFIG3 override: 0x%02X\n", base_config.config3);
     }
     if (args.chnset >= 0) {
         uint8_t val = static_cast<uint8_t>(args.chnset);
-        config.ch1set = val;
-        config.ch2set = val;
-        config.ch3set = val;
-        config.ch4set = val;
-        config.ch5set = val;
-        config.ch6set = val;
-        config.ch7set = val;
-        config.ch8set = val;
+        base_config.ch1set = val;
+        base_config.ch2set = val;
+        base_config.ch3set = val;
+        base_config.ch4set = val;
+        base_config.ch5set = val;
+        base_config.ch6set = val;
+        base_config.ch7set = val;
+        base_config.ch8set = val;
         std::printf("  CHnSET override: 0x%02X (all 8 channels)\n", val);
     }
+
+    // Build per-port config array. All ports start with base_config.
+    // The BIAS port gets modified register values.
+    ads1299::DeviceConfig port_configs[ads1299::MAX_PORTS];
+    for (int i = 0; i < args.num_ports; ++i) {
+        port_configs[i] = base_config;
+    }
+
+    // Apply BIAS configuration to the specified port (1-indexed)
+    if (args.bias_port > 0) {
+        int bias_idx = args.bias_port - 1;  // Convert to 0-indexed
+        if (bias_idx >= args.num_ports) {
+            std::fprintf(stderr, "Error: --bias-port %d exceeds number of ports (%d)\n",
+                         args.bias_port, args.num_ports);
+            return 1;
+        }
+
+        auto& bc = port_configs[bias_idx];
+
+        // CONFIG3 bit 4 (PD_BIAS): power on the bias amplifier
+        // Base: 0xE0 = 1110_0000 -> 0xF0 = 1111_0000
+        bc.config3 = static_cast<uint8_t>(bc.config3 | 0x10);
+
+        // BIAS_SENSP: route P-inputs of channels 1-7 into the bias amplifier
+        // Bit 0=ch1, bit 1=ch2, ..., bit 6=ch7, bit 7=ch8
+        // Ch8 is the bias OUTPUT electrode, so exclude it from inputs
+        bc.bias_sensp = 0x7F;  // Channels 1-7 P-inputs
+
+        // BIAS_SENSN: route N-inputs of channels 1-7 into the bias amplifier
+        // Same routing as SENSP for maximum common-mode rejection
+        bc.bias_sensn = 0x7F;  // Channels 1-7 N-inputs
+
+        // CH8SET: MUX=BIAS_DRP (0b110) to drive the bias amplifier output
+        // through channel 8's positive electrode. Gain=1 (safe for bias output).
+        // ADS1299 datasheet Table 18: MUX[2:0]=110 = BIAS_DRP
+        bc.ch8set = 0x06;  // PGA gain=1 (bits[6:4]=000), MUX=BIAS_DRP (bits[2:0]=110)
+
+        std::printf("  BIAS drive enabled on Port%d:\n", args.bias_port);
+        std::printf("    CONFIG3  = 0x%02X (PD_BIAS=1, bias amplifier powered on)\n", bc.config3);
+        std::printf("    BIAS_SENSP = 0x%02X (ch1-7 P-inputs routed to bias amp)\n", bc.bias_sensp);
+        std::printf("    BIAS_SENSN = 0x%02X (ch1-7 N-inputs routed to bias amp)\n", bc.bias_sensn);
+        std::printf("    CH8SET   = 0x%02X (gain=1, MUX=BIAS_DRP — bias output)\n", bc.ch8set);
+    }
+
     for (int i = 0; i < args.num_ports; ++i) {
         if (!g_running) {
             std::printf("\n[CANCELLED] Ctrl+C during configuration\n");
             return 1;
         }
-        bool success = ads1299::ADS1299Controller::initialize_device(*devices[i], config);
+        bool success = ads1299::ADS1299Controller::initialize_device(*devices[i], port_configs[i]);
         if (!success) {
             std::fprintf(stderr, "\n[FAIL] %s failed to configure registers\n",
                          devices[i]->config().port_name);
@@ -556,7 +607,7 @@ int main(int argc, char* argv[]) {
 
         healthy_count = run_tiered_recovery(
             devices, i2c, port_health, port_dead,
-            args.num_ports, config, g_running);
+            args.num_ports, port_configs, g_running);
 
         if (!g_running) {
             std::printf("\n[CANCELLED] Ctrl+C during recovery\n");

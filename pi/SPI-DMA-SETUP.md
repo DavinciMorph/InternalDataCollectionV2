@@ -202,6 +202,31 @@ From BCM2711 datasheet section 4.2.1.3 (page 62), with corrections:
 | SPI4/5 errors after mux service runs | Driver probed before mux was set (race) | `sudo modprobe -r spi_bcm2835 && sudo modprobe spi_bcm2835` |
 | WiFi broken after boot | Legacy DMA channel mask was expanded (channels 1/3) | Do NOT modify the legacy DMA `brcm,dma-channel-mask` |
 | Pi won't boot / no SSH | Bad overlay or DMA conflict | Pull SD card, edit config.txt from another machine, remove offending `dtoverlay=` line |
+| Transfer size too small for DMA | spi-bcm2835 has ~96 byte min for DMA | Smaller transfers use PIO regardless (our 108+ byte reads always use DMA) |
+
+### PACTL_CS Mux Debugging
+
+If the confirmed `0x03000000` value does not work on different hardware, try all 8 combinations of bits 23/24/25:
+
+```
+0x00000000 (none)
+0x00800000 (MUX_2 only)
+0x01000000 (MUX_0 only)       <-- routes SPI4 DREQs
+0x01800000 (MUX_0 + MUX_2)
+0x02000000 (MUX_1 only)       <-- routes SPI5 DREQs
+0x02800000 (MUX_1 + MUX_2)
+0x03000000 (MUX_0 + MUX_1)    <-- our confirmed working value
+0x03800000 (all three)
+```
+
+Test manually with `sudo devmem2 0xfe204e00 w <VALUE>`, then reload the SPI driver:
+```bash
+sudo modprobe -r spi_bcm2835 && sudo modprobe spi_bcm2835
+```
+
+### Alternative: Kernel Module Approach
+
+For production use, a kernel module that writes PACTL_CS during SPI driver init would be more robust than a systemd service + devmem2. This could be implemented as a small platform driver that the DT overlay loads before the SPI driver probes. Not implemented in our system (systemd service works reliably).
 
 ## Validation
 

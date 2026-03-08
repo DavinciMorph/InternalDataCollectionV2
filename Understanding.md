@@ -941,3 +941,50 @@ This failure was NOT detected by init because of two known limitations:
 2. **`verify_port_data()` only checks status bytes**, not channel data values. The 0xC0 top nibble of the status byte was valid — the ADS1299 was converting and streaming correctly, just reading from the wrong input mux. Channel-level data validation (checking for expected test signal range) would have caught this.
 
 **Decision:** User declined implementing channel-level data validation since the system won't remain in test mode much longer. The register verification blind spot is documented here for reference. A production system should implement per-device register readback verification using the full daisy-chain RREG protocol (clock out N×bytes for N devices).
+
+---
+
+## 2026-02-19 Session: WiFi Disconnect Investigation
+
+### Problem
+
+A 20-minute run was perfectly stable for 18.5 minutes (275,110 samples, 250.0 Hz, zero corruption, zero drops), then the client started disconnecting and reconnecting 5 times in the final ~92 seconds. Server was flawless throughout — purely a client-side issue.
+
+### Root Cause: WiFi 2.4 GHz Congestion
+
+Two independent agents (error-detective, performance-engineer) both ruled out every code-level hypothesis and converged on the same answer: **2.4 GHz WiFi congestion on channel 11** caused transient packet loss exceeding the server's 2.0-second `send_all()` timeout.
+
+- WiFi environment scan: 21 visible networks, 4 overlapping channel 11
+- Server `SEND_TIMEOUT_SEC = 2.0` + `SO_SNDBUF = 256KB` = **3.58 seconds** total tolerance before disconnect
+- Windows client has no WiFi scan suppression (Pi has `wifi-noscan.service`)
+- The worsening queue spikes (0 → 0 → 149 → 142) indicate progressive WiFi degradation
+
+### Hypotheses Ruled Out
+
+| Hypothesis | Verdict |
+|---|---|
+| `pending_samples` unbounded growth | Drains at 12,500/sec vs 250/sec arrival. Steady state ~375 items. |
+| GC pressure (90M objects created) | Only ~30K GC-tracked alive at once. Gen2 pause ~3ms. |
+| CSV writer blocking GIL | Own thread, `write()` releases GIL |
+| Main thread processing degradation | Cost constant at ~7-10ms/tick, doesn't grow over time |
+
+### Potential Fixes (Not Yet Applied)
+
+- Increase `SEND_TIMEOUT_SEC` from 2.0 to 6.0s and `SO_SNDBUF` from 256KB to 1MB (~12s tolerance)
+- Disable WiFi power management on Windows client
+- Switch Pi to 5 GHz WiFi (less congested)
+- Use wired Ethernet (eliminates WiFi entirely)
+
+---
+
+## Register Configuration Change: Test Mode → Normal Acquisition (2026-02-19)
+
+Switched from internal test signal to normal electrode input for live EEG recording.
+
+| Register | Old Value | New Value | Meaning |
+|----------|-----------|-----------|---------|
+| CONFIG2 | `0xD0` | `0xC0` | Test signal OFF |
+| CH1-8SET | `0x05` | `0x60` | Gain=24, normal electrode input (was gain=1, test signal) |
+| CONFIG3 | `0xE0` | `0xE0` | Unchanged (internal reference ON) |
+
+Changes in `Cpp Implementation/include/ads1299/registers.hpp`, `DeviceConfig` struct defaults.
