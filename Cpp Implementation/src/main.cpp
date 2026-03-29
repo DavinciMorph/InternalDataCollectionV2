@@ -192,9 +192,9 @@ static int run_tiered_recovery(
     int healthy = count_healthy();
 
     // ---------------------------------------------------------------
-    // TIER 1: RDATAC cycling — ~200ms/attempt, 8 attempts/port
+    // TIER 1: RDATAC cycling — ~200ms/attempt, 100 attempts/port
     // ---------------------------------------------------------------
-    constexpr int TIER1_ATTEMPTS = 8;
+    constexpr int TIER1_ATTEMPTS = 100;
 
     std::printf("\n  --- Tier 1: RDATAC cycling (%d attempts/port) ---\n",
                 TIER1_ATTEMPTS);
