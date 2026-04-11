@@ -55,6 +55,7 @@ uint8_t I2CDevice::read_byte(uint8_t addr, uint8_t reg) {
     };
 
     if (::ioctl(fd_, I2C_RDWR, &data) < 0) {
+        error_count_.fetch_add(1, std::memory_order_relaxed);
         return 0xFF;
     }
 
@@ -80,7 +81,11 @@ bool I2CDevice::write_byte(uint8_t addr, uint8_t reg, uint8_t val) {
         .nmsgs = 1,
     };
 
-    return ::ioctl(fd_, I2C_RDWR, &data) >= 0;
+    if (::ioctl(fd_, I2C_RDWR, &data) < 0) {
+        error_count_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    return true;
 }
 
 } // namespace ads1299

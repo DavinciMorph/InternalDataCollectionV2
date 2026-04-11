@@ -4,7 +4,7 @@ import paramiko
 import os
 import sys
 
-HOST = "192.168.1.175"
+HOST = "192.168.1.99"
 USER = "morph"
 PASS = "morph"
 LOCAL_BASE = os.path.join(os.path.dirname(__file__), "Cpp Implementation")

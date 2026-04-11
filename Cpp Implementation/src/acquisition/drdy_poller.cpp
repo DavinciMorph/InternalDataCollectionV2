@@ -42,9 +42,14 @@ bool DRDYPoller::poll(double timeout_sec) {
     long timeout_ns = static_cast<long>(timeout_sec * 1e9);
     advance_timespec(deadline, timeout_ns);
 
+    uint32_t iterations = 0;
+
     // First I2C read is immediate (no sleep before first check)
     uint8_t val = i2c_.read_byte(addr_, TCA9534_INPUT_PORT);
+    ++iterations;
     if ((val & mask_) == 0) {
+        last_poll_iterations_ = iterations;
+        if (iterations > max_poll_iterations_) max_poll_iterations_ = iterations;
         return true;
     }
 
@@ -62,8 +67,11 @@ bool DRDYPoller::poll(double timeout_sec) {
 
         // Read TCA9534 input register, check all DRDY bits
         val = i2c_.read_byte(addr_, TCA9534_INPUT_PORT);
+        ++iterations;
         // DRDY is active LOW: bit=0 means ready. All masked bits must be 0.
         if ((val & mask_) == 0) {
+            last_poll_iterations_ = iterations;
+            if (iterations > max_poll_iterations_) max_poll_iterations_ = iterations;
             return true;
         }
 
@@ -80,6 +88,8 @@ bool DRDYPoller::poll(double timeout_sec) {
 
         // Check timeout
         if (!timespec_le(now, deadline)) {
+            last_poll_iterations_ = iterations;
+            if (iterations > max_poll_iterations_) max_poll_iterations_ = iterations;
             return false;
         }
     }

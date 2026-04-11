@@ -2,6 +2,7 @@
 #include "ads1299/types.hpp"
 #include "ads1299/spi_device.hpp"
 #include "ads1299/controller.hpp"
+#include "ads1299/impedance.hpp"
 #include "hardware/spi_bus.hpp"
 #include "hardware/i2c_device.hpp"
 #include "hardware/tca9534.hpp"
@@ -53,6 +54,8 @@ struct Args {
     int sps = -1;           // -1 = use default (250); override with --sps 500
     bool test_signal = false; // --test-signal: CONFIG2=0xD0, CHnSET=0x65
     int bias_port = 0;      // 0 = disabled; 1-7 = enable BIAS drive on that port number
+    bool check_impedance = false; // --check-impedance: run continuous impedance check mode
+    int monitor_supply = 0;     // 0 = disabled; 1-7 = port number to use ch8 as MVDD monitor
 };
 
 static bool parse_port(const char* str, ads1299::PortConfig& out) {
@@ -122,6 +125,17 @@ static Args parse_args(int argc, char* argv[]) {
             args.test_signal = true;
         } else if (std::strcmp(argv[i], "--bias-port") == 0 && i + 1 < argc) {
             args.bias_port = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
+        } else if (std::strcmp(argv[i], "--check-impedance") == 0) {
+            args.check_impedance = true;
+        } else if (std::strcmp(argv[i], "--monitor-supply") == 0 && i + 1 < argc) {
+            args.monitor_supply = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
+        } else if (std::strcmp(argv[i], "--dev") == 0) {
+            // Dev mode: single ADS1299 on SPI0.0 (Port1, 1 device)
+            ports_specified = true;
+            args.num_ports = 0;
+            if (ads1299::make_port_config(0, 0, "Port1", 1, args.ports[0])) {
+                args.num_ports = 1;
+            }
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             std::printf("Usage: %s [--ports bus,dev,name,num_daisy ...] "
                         "[--full-csv] [--no-csv] [--duration SEC] "
@@ -149,7 +163,10 @@ static Args parse_args(int argc, char* argv[]) {
                         "                  sets CONFIG2=0xD0, CHnSET=0x05 (gain=1, test mux)\n"
                         "  --bias-port N:  enable BIAS drive on port N (1-7, default: disabled)\n"
                         "                  Channels 1-7 route to bias amp, ch8 drives BIAS out\n"
-                        "                  Sets CONFIG3=0xF0, BIAS_SENSP/N=0x7F, CH8SET=0x06\n",
+                        "                  Sets CONFIG3=0xF0, BIAS_SENSP/N=0x7F, CH8SET=0x06\n"
+                        "  --monitor-supply N: configure last device ch8 on port N (1-7) as MVDD monitor\n"
+                        "                  Sets CH8SET=0x03 (gain=1, MUX=MVDD) for in-band supply tracking\n"
+                        "                  Expected AVDD=5.0V reads as ~9.3M LSB; 65mV shift = ~121K LSB\n",
                         argv[0]);
             std::exit(0);
         }
@@ -363,6 +380,15 @@ int main(int argc, char* argv[]) {
                 args.num_ports, total_devices, total_channels, display_sps,
                 args.host, args.port);
 
+    // --- Disable WiFi power save ---
+    // WiFi beacon wakeups (100 TU = 102.4ms = 9.766 Hz) cause periodic current
+    // spikes on the 3.3V rail that couple EMI into ADS1299 analog inputs, creating
+    // a harmonic comb at 9.766 Hz intervals (Q>230). Disabling power save keeps
+    // the radio continuously active, eliminating the periodic transients.
+    if (std::system("iw dev wlan0 set power_save off 2>/dev/null") == 0) {
+        std::printf("WiFi power save disabled (anti-EMI)\n");
+    }
+
     // --- Signal handling ---
     // SIGPIPE: disconnected TCP client must not kill the process
     signal(SIGPIPE, SIG_IGN);
@@ -539,6 +565,24 @@ int main(int argc, char* argv[]) {
         std::printf("    CH8SET   = 0x%02X (gain=1, MUX=BIAS_DRP — bias output)\n", bc.ch8set);
     }
 
+    // B.6: Apply supply monitor config to the last device's ch8 on the specified port
+    if (args.monitor_supply > 0) {
+        int mon_idx = args.monitor_supply - 1;  // Convert to 0-indexed
+        if (mon_idx >= args.num_ports) {
+            std::fprintf(stderr, "Error: --monitor-supply %d exceeds number of ports (%d)\n",
+                         args.monitor_supply, args.num_ports);
+            return 1;
+        }
+        // ADS1299 datasheet Table 18: MUX[2:0]=011 = MVDD for supply measurement
+        // PGA[6:4]=000 = gain 1 (full-scale ±4.5V with VREF=4.5V)
+        // MVDD reading: 24-bit signed, full-scale = ±VREF/gain = ±4.5V
+        // Expected AVDD = 5.0V → ADC code ≈ (5.0/4.5) * 2^23 ≈ 9,320,675
+        // A 65mV shift would appear as Δcode ≈ (0.065/4.5) * 2^23 ≈ 121,099
+        port_configs[mon_idx].ch8set = 0x03;
+        std::printf("  Supply monitor on Port%d last device ch8: CH8SET=0x03 (gain=1, MUX=MVDD)\n",
+                    args.monitor_supply);
+    }
+
     for (int i = 0; i < args.num_ports; ++i) {
         if (!g_running) {
             std::printf("\n[CANCELLED] Ctrl+C during configuration\n");
@@ -685,6 +729,96 @@ int main(int argc, char* argv[]) {
             if (port_dead[p]) std::printf(" %s", devices[p]->config().port_name);
         }
         std::printf("\n");
+    }
+
+    // --- Impedance check mode: reconfigure for impedance then fall through to normal streaming ---
+    if (args.check_impedance) {
+        std::fprintf(stderr,
+            "\n============================================================\n"
+            "IMPEDANCE MODE: reconfiguring for impedance measurement\n"
+            "============================================================\n");
+
+        // Stop all ports before reconfiguring
+        for (auto* dev : active_devices) {
+            dev->start_low();
+        }
+        sleep_sec(0.02);
+        for (auto* dev : active_devices) {
+            dev->send_command(ads1299::Cmd::STOP);
+        }
+        sleep_sec(0.01);
+        for (int rep = 0; rep < 10; ++rep) {
+            for (auto* dev : active_devices) {
+                dev->send_command(ads1299::Cmd::SDATAC);
+            }
+            sleep_sec(0.01);
+        }
+        sleep_sec(0.05);
+
+        // Reconfigure each port for impedance measurement:
+        //   - Gain=1 (CHnSET=0x00) — allows measurement up to ~750kΩ at 6µA
+        //   - SRB1 ON (MISC1=0x20) — provides current return path through body
+        //   - P-side excitation only (LOFF_SENSP=0xFF, LOFF_SENSN=0x00)
+        //     Current flows: P electrode → skin → body → SRB1 electrode → return
+        //   - LOFF: 6µA AC at fDR/4 (62.5Hz at 250 SPS)
+        //   - Lead-off comparators enabled (CONFIG4=0x02)
+        for (auto* dev : active_devices) {
+            // Gain=1 on all channels
+            for (int ch = 0; ch < 8; ++ch) {
+                ads1299::Reg reg = static_cast<ads1299::Reg>(
+                    static_cast<uint8_t>(ads1299::Reg::CH1SET) + ch);
+                dev->write_register(reg, 0x00);
+                sleep_sec(0.002);
+            }
+            // SRB1 ON — connects all N inputs
+            dev->write_register(ads1299::Reg::MISC1, 0x20);
+            sleep_sec(0.01);
+            // LOFF: 6µA AC excitation at fDR/4 (62.5 Hz)
+            // bits[3:2]=10 (6µA) | bits[1:0]=11 (fDR/4) = 0x0B
+            dev->write_register(ads1299::Reg::LOFF, 0x0B);
+            sleep_sec(0.01);
+            // P-side only, SRB1 ON
+            dev->write_register(ads1299::Reg::LOFF_SENSP, 0xFF);
+            sleep_sec(0.01);
+            dev->write_register(ads1299::Reg::LOFF_SENSN, 0x00);
+            sleep_sec(0.01);
+            // Enable lead-off comparators
+            dev->write_register(ads1299::Reg::CONFIG4, 0x02);
+            sleep_sec(0.01);
+
+            // Verify critical registers (readback only works for first device in chain)
+            uint8_t rb_ch7  = dev->read_register(ads1299::Reg::CH7SET);
+            uint8_t rb_loff = dev->read_register(ads1299::Reg::LOFF);
+            uint8_t rb_sensp = dev->read_register(ads1299::Reg::LOFF_SENSP);
+            uint8_t rb_misc1 = dev->read_register(ads1299::Reg::MISC1);
+            uint8_t rb_cfg4 = dev->read_register(ads1299::Reg::CONFIG4);
+            uint8_t rb_sensn = dev->read_register(ads1299::Reg::LOFF_SENSN);
+            uint8_t rb_cfg3 = dev->read_register(ads1299::Reg::CONFIG3);
+            std::fprintf(stderr, "  %s verify: CH7SET=0x%02X(exp 0x00) LOFF=0x%02X(exp 0x0B) "
+                                 "SENSP=0x%02X(exp 0xFF) SENSN=0x%02X(exp 0x00) MISC1=0x%02X(exp 0x20) "
+                                 "CONFIG3=0x%02X CONFIG4=0x%02X(exp 0x02)\n",
+                         dev->config().port_name, rb_ch7, rb_loff, rb_sensp, rb_sensn, rb_misc1, rb_cfg3, rb_cfg4);
+        }
+
+        // Re-enter RDATAC + START on all ports
+        for (auto* dev : active_devices) {
+            dev->send_command(ads1299::Cmd::RDATAC);
+        }
+        sleep_sec(0.05);
+        {
+            ads1299::TCA9534MultiPin start_ctrl(i2c);
+            for (auto* dev : active_devices) {
+                start_ctrl.add_pin(dev->config().start_i2c_addr, dev->config().start_pin);
+            }
+            start_ctrl.set_all_high();
+        }
+        sleep_sec(0.1);
+
+        std::fprintf(stderr, "Impedance mode: gain=1, SRB1 on, LOFF 6µA AC P-side @ 62.5Hz\n"
+                             "Streaming on %s:%d\n", args.host, args.port);
+
+        // Fall through to normal Phase 4 + streaming — the impedance data is
+        // in the raw sample stream, client-side DFT extracts it
     }
 
     // --- Phase 4: Warmup + final health check ---
@@ -858,6 +992,28 @@ int main(int argc, char* argv[]) {
     engine.set_csv_enabled(args.full_csv);
     engine.set_streaming_server(&streaming_server);
 
+    // B.6: Wire up supply monitor channel if configured
+    if (args.monitor_supply > 0) {
+        int mon_idx = args.monitor_supply - 1;
+        // The supply channel is ch8 of the last device on the monitored port.
+        // Compute global channel index: sum all channels of ports before mon_idx,
+        // then add (num_devices - 1) * 8 + 7 for the last device's ch8.
+        int global_ch = 0;
+        for (int p = 0; p < active_num_ports; ++p) {
+            int n_dev = active_devices[p]->config().num_devices;
+            int n_ch = n_dev * ads1299::CHANNELS_PER_DEVICE;
+            if (p == mon_idx) {
+                // ch8 of last device = last channel of this port
+                global_ch += n_ch - 1;
+                break;
+            }
+            global_ch += n_ch;
+        }
+        engine.set_supply_monitor_channel(global_ch);
+        std::printf("  Supply monitor: global channel %d (Port%d last device ch8)\n",
+                    global_ch, args.monitor_supply);
+    }
+
     // If duration specified, set up a timer thread
     if (args.duration_sec > 0) {
         std::printf("  Auto-stop after %d seconds\n", args.duration_sec);
@@ -901,6 +1057,75 @@ int main(int argc, char* argv[]) {
                             static_cast<unsigned long>(ss.drops),
                             ss.ring_queued,
                             ss.connected ? "[connected]" : "[no client]");
+
+                // B.1: DC offset watchdog
+                if (s.offset_alert) {
+                    std::printf("           [OFFSET ALERT] %d/%d channels shifted, max_offset=%d LSB (%.3f mV)",
+                                s.offset_alert_count, active_total_channels,
+                                s.max_offset, s.max_offset * 0.0223e-3);
+                    if (s.offset_alert_onset > 0.0) {
+                        std::printf(" onset=%.1fs", s.offset_alert_onset);
+                    }
+                    std::printf("\n");
+                    // B.1b: Per-port breakdown
+                    std::printf("           port offsets:");
+                    for (int p = 0; p < s.num_offset_ports; ++p) {
+                        std::printf(" P%d=%+dK", p + 1, s.port_offset[p] / 1000);
+                    }
+                    std::printf(" LSB\n");
+                }
+
+                // B.5: Status byte tracking
+                bool status_anomaly = false;
+                for (int p = 0; p < s.num_status_ports; ++p) {
+                    if ((s.status_bytes[p] & 0xF0) != 0xC0) {
+                        status_anomaly = true;
+                        break;
+                    }
+                }
+                if (status_anomaly) {
+                    std::printf("           [STATUS ALERT] status bytes:");
+                    for (int p = 0; p < s.num_status_ports; ++p) {
+                        std::printf(" 0x%02X", s.status_bytes[p]);
+                    }
+                    std::printf("\n");
+                }
+
+                // B.3: I2C error counter
+                uint64_t i2c_errs = i2c.error_count();
+                // B.4: DRDY poll iteration counter
+                uint32_t drdy_last_iter = drdy_poller.last_poll_iterations();
+                uint32_t drdy_max_iter = drdy_poller.max_poll_iterations();
+                std::printf("           diag: i2c_errors=%lu drdy_iter(last=%u max=%u)",
+                            static_cast<unsigned long>(i2c_errs),
+                            drdy_last_iter, drdy_max_iter);
+
+                // B.2: START pin watchdog — read TCA9534 output register
+                uint8_t start_reg = i2c.read_byte(0x21, ads1299::TCA9534_OUTPUT_PORT);
+                uint8_t expected_start = 0;
+                for (int ap = 0; ap < active_num_ports; ++ap) {
+                    expected_start |= static_cast<uint8_t>(1u << active_configs[ap].start_pin);
+                }
+                if ((start_reg & expected_start) != expected_start) {
+                    std::printf(" [ALERT] START pins changed! reg=0x%02X expected=0x%02X",
+                                start_reg, expected_start);
+                }
+                std::printf("\n");
+
+                // B.6: Supply voltage monitor
+                if (s.supply_monitor_active) {
+                    // ADS1299 MVDD measurement: gain=1, VREF=4.5V (internal)
+                    // Full-scale = 2^23 = 8,388,608 corresponds to VREF = 4.5V
+                    // Voltage = code * 4.5 / 2^23
+                    constexpr double LSB_TO_V = 4.5 / 8388608.0;
+                    double v_now = s.supply_value * LSB_TO_V;
+                    double v_min = s.supply_min * LSB_TO_V;
+                    double v_max = s.supply_max * LSB_TO_V;
+                    std::printf("           supply: %.4fV (min=%.4fV max=%.4fV range=%.1fmV code=%d)\n",
+                                v_now, v_min, v_max,
+                                (v_max - v_min) * 1000.0,
+                                s.supply_value);
+                }
             }
         }
     });

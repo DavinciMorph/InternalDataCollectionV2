@@ -6,3 +6,26 @@ data/
 *.csv
 *.img.gz
 nul
+
+# Large data / recordings / generated artifacts (not tracked)
+client/experiment_data/
+client/notebooks/
+client/Force/
+client/videos/
+client/gestures/
+IMG_*.mov
+*.mov
+
+# Generated analysis output directories
+client/eeg_analysis_output/
+client/inductor_analysis_output/
+client/sync_analysis_output/
+client/quality_degradation_analysis/
+client/test_signal_analysis/
+client/p1d8_analysis/
+client/channel_similarity_analysis/
+
+# Generated plots and numpy dumps at client/ top level
+client/*.png
+client/*.npy
+client/*_results.txt

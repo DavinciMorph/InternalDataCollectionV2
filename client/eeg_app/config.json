@@ -1,0 +1,15 @@
+{
+  "pi_host": "10.42.0.1",
+  "ssh_user": "morph",
+  "ssh_password": "morph",
+  "tcp_port": 8888,
+  "binary_path": "~/ads1299-cpp/build/ads1299_acquire",
+  "default_sps": 250,
+  "extra_args": "",
+  "window_seconds": 5.0,
+  "y_range_uv": 200,
+  "output_dir": "experiment_data",
+  "last_participant_id": "",
+  "default_methodology": 1,
+  "default_hand": "Right"
+}

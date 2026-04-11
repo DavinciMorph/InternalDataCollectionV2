@@ -152,12 +152,95 @@ void AcquisitionEngine::run(volatile sig_atomic_t& running) {
                 }
             }
 
+            // B.5: Track first device's status byte per port
+            last_status_bytes_[p] = port_data.status_bytes[0][0];
+
             // Copy channel values into sample
             for (int d = 0; d < num_dev; ++d) {
                 for (int c = 0; c < CHANNELS_PER_DEVICE; ++c) {
                     sample.channels[ch_idx++] = port_data.channel_values[d][c];
                 }
             }
+        }
+
+        // B.1: DC offset watchdog (integer arithmetic only, zero allocation)
+        if (!baseline_locked_) {
+            // Accumulate running sums for baseline computation
+            for (int c = 0; c < total_channels_; ++c) {
+                channel_running_sum_[c] += sample.channels[c];
+            }
+            baseline_samples_++;
+            if (baseline_samples_ >= BASELINE_WINDOW) {
+                for (int c = 0; c < total_channels_; ++c) {
+                    channel_baseline_[c] = static_cast<int32_t>(
+                        channel_running_sum_[c] / static_cast<int64_t>(baseline_samples_));
+                }
+                baseline_locked_ = true;
+            }
+        } else {
+            // Compare each channel to baseline
+            int alert_count = 0;
+            int32_t max_off = 0;
+            for (int c = 0; c < total_channels_; ++c) {
+                int32_t diff = sample.channels[c] - channel_baseline_[c];
+                int32_t abs_diff = diff < 0 ? -diff : diff;
+                if (abs_diff > OFFSET_THRESHOLD) {
+                    alert_count++;
+                }
+                if (abs_diff > max_off) {
+                    max_off = abs_diff;
+                }
+            }
+            offset_alert_ = (alert_count > 0);
+            offset_alert_count_ = alert_count;
+            max_offset_ = max_off;
+
+            // B.1c: Track alert onset time (rising edge detection)
+            if (offset_alert_ && !offset_alert_prev_) {
+                offset_alert_onset_time_ = timestamp;  // Record onset
+            } else if (!offset_alert_ && offset_alert_prev_) {
+                offset_alert_onset_time_ = 0.0;  // Alert cleared
+            }
+            offset_alert_prev_ = offset_alert_;
+        }
+
+        // B.1b: Per-port mean EMA update (exponential moving average, alpha=1/64)
+        //   For each port, compute the mean of its channels, then update the EMA.
+        //   EMA stored as Q8 fixed-point: ema = ema - (ema >> 6) + (mean << 2)
+        //   This is equivalent to alpha=1/64 with Q8 precision.
+        {
+            int ch_base = 0;
+            for (int p = 0; p < num_ports_; ++p) {
+                int n_ch = devices_[p]->config().num_devices * CHANNELS_PER_DEVICE;
+                int64_t sum = 0;
+                for (int c = 0; c < n_ch; ++c) {
+                    sum += sample.channels[ch_base + c];
+                }
+                // mean in LSB (integer division)
+                int64_t mean_lsb = sum / n_ch;
+                // Update EMA: Q8 format, alpha=1/64
+                // ema = ema + (mean_Q8 - ema) / 64
+                int64_t mean_q8 = mean_lsb << 8;
+                port_mean_ema_[p] += (mean_q8 - port_mean_ema_[p]) >> 6;
+
+                ch_base += n_ch;
+            }
+            // Snapshot baseline EMA after the baseline window locks
+            if (baseline_locked_ && !port_baseline_set_ &&
+                baseline_samples_ == BASELINE_WINDOW) {
+                for (int p = 0; p < num_ports_; ++p) {
+                    port_baseline_ema_[p] = port_mean_ema_[p];
+                }
+                port_baseline_set_ = true;
+            }
+        }
+
+        // B.6: Supply voltage monitor — track MVDD channel min/max
+        if (supply_channel_idx_ >= 0 && supply_channel_idx_ < ch_idx) {
+            int32_t v = sample.channels[supply_channel_idx_];
+            supply_value_ = v;
+            if (v < supply_min_) supply_min_ = v;
+            if (v > supply_max_) supply_max_ = v;
         }
 
         // 5. Non-blocking push to SPSC ring buffer (CSV) — skipped when no CSV consumer
@@ -215,6 +298,35 @@ AcquisitionEngine::Stats AcquisitionEngine::get_stats() const {
     s.min_dt_ms = min_dt_ms_;
     s.max_dt_ms = max_dt_ms_;
     s.runtime_sec = clock_now() - start_time_;
+    // B.1: DC offset watchdog
+    s.offset_alert = offset_alert_;
+    s.offset_alert_count = offset_alert_count_;
+    s.max_offset = max_offset_;
+    s.offset_alert_onset = offset_alert_onset_time_;
+    // B.1b: Per-port mean offset from baseline
+    s.num_offset_ports = num_ports_;
+    for (int p = 0; p < num_ports_ && p < MAX_PORTS; ++p) {
+        if (port_baseline_set_) {
+            // Convert Q8 EMA difference back to integer LSB
+            s.port_offset[p] = static_cast<int32_t>(
+                (port_mean_ema_[p] - port_baseline_ema_[p]) >> 8);
+        } else {
+            s.port_offset[p] = 0;
+        }
+    }
+    // B.6: Supply voltage monitor
+    s.supply_monitor_active = (supply_channel_idx_ >= 0);
+    s.supply_value = supply_value_;
+    s.supply_min = supply_min_;
+    s.supply_max = supply_max_;
+    // Note: min/max are NOT reset here to preserve full-session extremes.
+    // The stats thread can compute per-interval deltas externally if needed.
+
+    // B.5: Status byte tracking
+    s.num_status_ports = num_ports_;
+    for (int p = 0; p < num_ports_ && p < MAX_PORTS; ++p) {
+        s.status_bytes[p] = last_status_bytes_[p];
+    }
     return s;
 }
 

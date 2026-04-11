@@ -34,10 +34,17 @@ public:
     uint8_t mask() const { return mask_; }
     bool has_pins() const { return mask_ != 0; }
 
+    // Poll iteration diagnostics: how many I2C reads per DRDY event
+    uint32_t last_poll_iterations() const { return last_poll_iterations_; }
+    uint32_t max_poll_iterations() const { return max_poll_iterations_; }
+
 private:
     I2CDevice& i2c_;
     uint8_t addr_;
     uint8_t mask_;  // Combined mask of all DRDY pins to check
+
+    uint32_t last_poll_iterations_ = 0;
+    uint32_t max_poll_iterations_ = 0;
 
     // Advance timespec by ns nanoseconds (handles tv_nsec overflow)
     static void advance_timespec(struct timespec& ts, long ns);

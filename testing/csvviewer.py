@@ -54,22 +54,28 @@ def parse_hierarchy(channel_names):
         'all_chs':      sorted list of all unique channel names (union across all)
         'port_devs':    {port: [sorted devices present under this port]}
         'port_dev_chs': {(port, dev): [sorted channels present under this combo]}
-    Returns None if channel names don't match hierarchical pattern.
+        'chan_indices':  list of column indices (into header[2:]) that are actual channels
+    Returns None if no channel names match hierarchical pattern.
     """
     pat = re.compile(r'^(Port\d+)_(dev\d+)_(ch\d+)$')
     ports_set, devs_set, chs_set = set(), set(), set()
     port_devs_map = {}       # port -> set of devs
     port_dev_chs_map = {}    # (port, dev) -> set of chs
-    for name in channel_names:
+    chan_indices = []         # column indices that are actual channels
+    for i, name in enumerate(channel_names):
         m = pat.match(name)
         if not m:
-            return None  # not hierarchical
+            continue  # skip non-channel columns (e.g. perf_counter)
         p, d, c = m.group(1), m.group(2), m.group(3)
         ports_set.add(p)
         devs_set.add(d)
         chs_set.add(c)
         port_devs_map.setdefault(p, set()).add(d)
         port_dev_chs_map.setdefault((p, d), set()).add(c)
+        chan_indices.append(i)
+
+    if not chan_indices:
+        return None  # no hierarchical channels found
 
     sort_key = lambda s: int(re.search(r'\d+', s).group())
     return {
@@ -78,6 +84,7 @@ def parse_hierarchy(channel_names):
         'all_chs':      sorted(chs_set, key=sort_key),
         'port_devs':    {p: sorted(ds, key=sort_key) for p, ds in port_devs_map.items()},
         'port_dev_chs': {k: sorted(cs, key=sort_key) for k, cs in port_dev_chs_map.items()},
+        'chan_indices':  chan_indices,
     }
 
 
@@ -91,12 +98,24 @@ class CSVViewer(QtWidgets.QMainWindow):
             header = next(reader)
             expected_cols = len(header)
             rows = [row for row in reader if len(row) == expected_cols]
-        self.channel_names = header[2:]
+        all_channel_names = header[2:]
 
         data = np.array(rows, dtype=np.float64)
         self.timestamps = data[:, 0]
         self.samples = data[:, 1].astype(int)
-        self.channel_data = data[:, 2:]
+
+        # Detect hierarchical naming
+        self.hierarchy = parse_hierarchy(all_channel_names)
+
+        # If hierarchy detected with extra non-channel columns, filter them out
+        if self.hierarchy and len(self.hierarchy['chan_indices']) < len(all_channel_names):
+            idx = self.hierarchy['chan_indices']
+            self.channel_names = [all_channel_names[i] for i in idx]
+            self.channel_data = data[:, 2:][:, idx]
+        else:
+            self.channel_names = all_channel_names
+            self.channel_data = data[:, 2:]
+
         self.num_channels = self.channel_data.shape[1]
         self.total = len(self.timestamps)
         self.sps = 250
@@ -104,9 +123,6 @@ class CSVViewer(QtWidgets.QMainWindow):
 
         # Build channel name -> column index lookup
         self.ch_index = {name: i for i, name in enumerate(self.channel_names)}
-
-        # Detect hierarchical naming
-        self.hierarchy = parse_hierarchy(self.channel_names)
 
         # Initial selection
         if self.hierarchy:
@@ -254,6 +270,61 @@ class CSVViewer(QtWidgets.QMainWindow):
         psd_bar.addWidget(self.yaxis_spin)
 
         layout.addLayout(psd_bar)
+
+        # SNR controls row
+        snr_bar = QtWidgets.QHBoxLayout()
+        snr_bar.addWidget(QtWidgets.QLabel('SNR:'))
+
+        snr_bar.addWidget(QtWidgets.QLabel('Signal'))
+        t0 = self.timestamps[0]
+        t_end = self.timestamps[-1]
+
+        self.snr_sig_start = QtWidgets.QDoubleSpinBox()
+        self.snr_sig_start.setRange(t0, t_end)
+        self.snr_sig_start.setValue(t0)
+        self.snr_sig_start.setSuffix(' s')
+        self.snr_sig_start.setSingleStep(0.5)
+        self.snr_sig_start.setDecimals(2)
+        snr_bar.addWidget(self.snr_sig_start)
+
+        snr_bar.addWidget(QtWidgets.QLabel('-'))
+        self.snr_sig_end = QtWidgets.QDoubleSpinBox()
+        self.snr_sig_end.setRange(t0, t_end)
+        self.snr_sig_end.setValue(min(t0 + 5.0, t_end))
+        self.snr_sig_end.setSuffix(' s')
+        self.snr_sig_end.setSingleStep(0.5)
+        self.snr_sig_end.setDecimals(2)
+        snr_bar.addWidget(self.snr_sig_end)
+
+        snr_bar.addWidget(QtWidgets.QLabel('  Noise'))
+        self.snr_noise_start = QtWidgets.QDoubleSpinBox()
+        self.snr_noise_start.setRange(t0, t_end)
+        self.snr_noise_start.setValue(t0)
+        self.snr_noise_start.setSuffix(' s')
+        self.snr_noise_start.setSingleStep(0.5)
+        self.snr_noise_start.setDecimals(2)
+        snr_bar.addWidget(self.snr_noise_start)
+
+        snr_bar.addWidget(QtWidgets.QLabel('-'))
+        self.snr_noise_end = QtWidgets.QDoubleSpinBox()
+        self.snr_noise_end.setRange(t0, t_end)
+        self.snr_noise_end.setValue(min(t0 + 5.0, t_end))
+        self.snr_noise_end.setSuffix(' s')
+        self.snr_noise_end.setSingleStep(0.5)
+        self.snr_noise_end.setDecimals(2)
+        snr_bar.addWidget(self.snr_noise_end)
+
+        self.snr_btn = QtWidgets.QPushButton('Compute SNR')
+        self.snr_btn.setStyleSheet('background-color: #00695c; color: white; padding: 4px 12px;')
+        self.snr_btn.clicked.connect(self.compute_snr)
+        snr_bar.addWidget(self.snr_btn)
+
+        self.snr_label = QtWidgets.QLabel('')
+        self.snr_label.setStyleSheet('color: #00e676; font-weight: bold; padding: 0 8px;')
+        snr_bar.addWidget(self.snr_label)
+
+        snr_bar.addStretch()
+        layout.addLayout(snr_bar)
 
         # Store last PSD data for export
         self._last_psd = None  # (t_start, t_end, channel_name, timestamps, segment_uv, freqs, psd)
@@ -545,6 +616,71 @@ class CSVViewer(QtWidgets.QMainWindow):
             writer.writerow(['frequency_Hz', 'power_uV2_per_Hz'])
             for freq, power in zip(freqs, psd):
                 writer.writerow([f'{freq:.4f}', f'{power:.6e}'])
+
+    def compute_snr(self):
+        LSB_UV = 4.5 / (8388608 * 24) * 1e6
+
+        sig_start = self.snr_sig_start.value()
+        sig_end = self.snr_sig_end.value()
+        noise_start = self.snr_noise_start.value()
+        noise_end = self.snr_noise_end.value()
+
+        if sig_end <= sig_start or noise_end <= noise_start:
+            self.snr_label.setText('Invalid range')
+            return
+
+        # Extract signal segment
+        i0 = int(np.searchsorted(self.timestamps, sig_start))
+        i1 = int(np.searchsorted(self.timestamps, sig_end))
+        if i1 - i0 < 2:
+            self.snr_label.setText('Signal too short')
+            return
+        signal_seg = self.channel_data[i0:i1, self.selected_channel] * LSB_UV
+
+        # Extract noise segment
+        j0 = int(np.searchsorted(self.timestamps, noise_start))
+        j1 = int(np.searchsorted(self.timestamps, noise_end))
+        if j1 - j0 < 2:
+            self.snr_label.setText('Noise too short')
+            return
+        noise_seg = self.channel_data[j0:j1, self.selected_channel] * LSB_UV
+
+        # Apply active filters
+        for segment in [signal_seg, noise_seg]:
+            pass  # filters applied below on copies
+
+        signal_seg = signal_seg.copy()
+        noise_seg = noise_seg.copy()
+
+        if self.hpf_on:
+            hpf_sos = sig.butter(10, 1.0, btype='high', fs=self.sps, output='sos')
+            signal_seg = sig.sosfiltfilt(hpf_sos, signal_seg)
+            noise_seg = sig.sosfiltfilt(hpf_sos, noise_seg)
+        if self.lpf_on:
+            lpf_sos = sig.butter(10, 50.0, btype='low', fs=self.sps, output='sos')
+            signal_seg = sig.sosfiltfilt(lpf_sos, signal_seg)
+            noise_seg = sig.sosfiltfilt(lpf_sos, noise_seg)
+        if self.notch_on:
+            notch_b, notch_a = sig.iirnotch(60.0, Q=30.0, fs=self.sps)
+            signal_seg = sig.filtfilt(notch_b, notch_a, signal_seg)
+            noise_seg = sig.filtfilt(notch_b, notch_a, noise_seg)
+
+        # Remove DC from both
+        signal_seg -= signal_seg.mean()
+        noise_seg -= noise_seg.mean()
+
+        rms_signal = np.sqrt(np.mean(signal_seg ** 2))
+        rms_noise = np.sqrt(np.mean(noise_seg ** 2))
+
+        if rms_noise < 1e-12:
+            self.snr_label.setText('Noise RMS ~ 0')
+            return
+
+        snr_db = 20 * np.log10(rms_signal / rms_noise)
+
+        self.snr_label.setText(
+            f'{self._current_name()}:  SNR = {snr_db:.1f} dB  |  '
+            f'Signal RMS = {rms_signal:.2f} uV  |  Noise RMS = {rms_noise:.2f} uV')
 
     def _toggle_filter(self, attr, btn, on_label, off_label):
         setattr(self, attr, not getattr(self, attr))

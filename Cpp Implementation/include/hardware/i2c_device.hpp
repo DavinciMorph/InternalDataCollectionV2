@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 
@@ -26,12 +27,16 @@ public:
     int fd() const { return fd_; }
     bool is_open() const { return fd_ >= 0; }
 
+    // Cumulative I2C ioctl failure count (diagnostic — reported in stats thread)
+    uint64_t error_count() const { return error_count_.load(std::memory_order_relaxed); }
+
     // Access mutex for external callers that need to batch operations
     std::mutex& mutex() { return mutex_; }
 
 private:
     int fd_;
     std::mutex mutex_;
+    std::atomic<uint64_t> error_count_{0};
 };
 
 } // namespace ads1299
