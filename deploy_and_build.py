@@ -4,10 +4,10 @@ import paramiko
 import os
 import sys
 
-HOST = "192.168.1.99"
+HOST = "10.42.0.1"
 USER = "morph"
 PASS = "morph"
-LOCAL_BASE = os.path.join(os.path.dirname(__file__), "Cpp Implementation")
+LOCAL_BASE = os.path.join(os.path.dirname(__file__), "Cpp Implementation (Pi)")
 REMOTE_BASE = "/home/morph/ads1299-cpp"
 
 def main():
